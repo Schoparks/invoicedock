@@ -1,6 +1,6 @@
 # 票栈源码部署
 
-以下为 Linux 服务器上的通用 Conda、systemd 和 Nginx 部署参考；文中的域名和路径均为示例。真实部署信息保存在 Git 忽略的私有运维记录中，由服务器维护者与 Hermes 交接。
+以下为 Linux 服务器上的通用 Conda、systemd 和 Nginx 部署参考；文中的域名和路径均为示例。请按自己的运行环境修改示例。
 
 应用保持单进程运行：同一进程提供 HTTP 服务、使用 SQLite 并执行 IMAP 轮询。不要配置多个 Uvicorn/Gunicorn worker、多个服务副本或自动重载进程来访问同一数据目录。
 
@@ -200,7 +200,7 @@ sudo systemctl start invoice-desk
 
 ### 通过 Git 更新
 
-GitHub `main` 为后续源码更新入口。不要再上传散文件覆盖服务器源码。现有 MCSManager、Caddy 等部署由 Hermes 核对实际路径和托管方式后操作，不直接套用 systemd 命令。
+GitHub `main` 为源码更新入口。本说明以 systemd 为例，其他运行方式请按实际服务管理方式调整。
 
 1. 检查 `git status --short` 与 `git remote -v`，确认源码仓库和工作区。若有改动先交由维护者处理，不强制重置。
 2. 记录 `git rev-parse HEAD`，按上面的步骤停机并备份完整数据、原密钥和配置。建议将运行数据与私密配置放在源码目录外，通过 `INVOICE_DATA_DIR` 指向实际数据目录。

@@ -1,4 +1,4 @@
-"""Pull main and refresh locked dependencies; service lifecycle belongs to the operator."""
+"""Pull main and refresh locked dependencies."""
 from importlib import metadata
 from pathlib import Path
 import subprocess
@@ -40,7 +40,7 @@ def update(root):
     else:
         print('锁定依赖未变且已安装，跳过安装。', flush=True)
     print(f'源码版本：{previous[:12]} → {current[:12]}', flush=True)
-    print('更新完成。请通过现有服务管理器启动/重启；本脚本不操作服务、数据、配置或 Cloudflare Worker。', flush=True)
+    print('更新完成。', flush=True)
 
 
 if __name__ == '__main__':
