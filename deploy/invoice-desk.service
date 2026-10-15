@@ -1,0 +1,23 @@
+[Unit]
+Description=InvoiceDock
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=invoice
+Group=invoice
+WorkingDirectory=/srv/invoice-desk
+# 按服务器上的 Conda 环境实际路径修改，保持单进程启动。
+ExecStart=/opt/miniconda3/envs/invoice-desk/bin/python /srv/invoice-desk/run.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/invoice-desk/data
+
+[Install]
+WantedBy=multi-user.target

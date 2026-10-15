@@ -1,0 +1,11 @@
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.20,<1
+pymupdf>=1.25,<2
+Pillow>=11,<13
+openpyxl>=3.1,<4
+defusedxml==0.7.1
+httpx>=0.28,<1
+cryptography>=45,<49
+python-dotenv>=1,<2
+rapidocr-onnxruntime==1.4.4

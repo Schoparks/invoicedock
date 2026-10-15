@@ -1,0 +1,11 @@
+name = "invoice-receipts"
+main = "cloudflare-email-worker.mjs"
+compatibility_date = "2026-10-15"
+# Use a publicly reachable HTTPS ingress, including for same-zone email events.
+compatibility_flags = ["global_fetch_strictly_public"]
+workers_dev = false
+
+[vars]
+# Replace with your own HTTPS ingress before deployment.
+INVOICE_INGRESS_URL = "https://invoices.example.com/api/inbound/email"
+# Store INVOICE_INBOUND_SECRET with `wrangler secret put`, never in source.
