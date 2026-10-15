@@ -86,7 +86,7 @@ class InvoiceApiTests(unittest.TestCase):
         self.assertEqual((match['total_cents'], match['gap_cents']), (1234, 0))
 
     def test_exact_match_and_draft_reservation_prevent_double_use(self):
-        large = self.invoice(700)
+        self.invoice(700)
         left, right = self.invoice(510), self.invoice(490)
         result = self.match()['combinations'][0]
         self.assertEqual(set(result['invoice_ids']), {left['id'], right['id']})
@@ -96,8 +96,27 @@ class InvoiceApiTests(unittest.TestCase):
         self.call('PATCH', '/api/invoices/' + left['id'], {'amount_cents': 520}, status=409)
         remaining = self.match()
         self.assertEqual(remaining['candidate_count'], 1)
-        self.assertEqual(remaining['combinations'][0]['invoice_ids'], [large['id']])
-        self.assertEqual(remaining['combinations'][0]['gap_cents'], 300)
+        self.assertEqual(remaining['combinations'], [])
+        self.assertIn('额度不足', remaining['message'])
+
+    def test_match_closest_above_target_and_respects_quota(self):
+        self.invoice(700)
+        self.invoice(400)
+        self.invoice(1500)
+        matching = self.match()
+        self.assertEqual(matching['combinations'][0]['total_cents'], 1100)
+        self.assertEqual(matching['combinations'][0]['gap_cents'], -100)
+        self.assertTrue(all(row['total_cents'] >= 1000 for row in matching['combinations']))
+        quota = self.call('POST', '/api/quotas', {'month': '2026-10', 'category': '餐饮', 'amount_cents': 1200})
+        matching = self.match(quota_id=quota['id'])
+        self.assertEqual([row['total_cents'] for row in matching['combinations']], [1100])
+        low_quota = self.call('POST', '/api/quotas', {'month': '2026-11', 'category': '餐饮', 'amount_cents': 900})
+        error = self.call('POST', '/api/match', {'target_cents': 1000, 'quota_id': low_quota['id']}, status=400)
+        self.assertIn('额度不足', error['detail'])
+        combination = matching['combinations'][0]
+        batch = self.call('POST', '/api/batches', {'name': '超出目标但在额度内',
+                         'invoice_ids': combination['invoice_ids'], 'quota_id': quota['id']})
+        self.assertEqual(batch['total_cents'], 1100)
 
     def test_cancel_and_reject_release_invoices_but_keep_history_paid_is_final(self):
         invoice = self.invoice(seller='最初商家')
@@ -125,6 +144,8 @@ class InvoiceApiTests(unittest.TestCase):
         first, second, other = self.invoice(600), self.invoice(500), self.invoice(200, category='交通')
         matching = self.match(quota_id=quota['id'])
         self.assertEqual(matching['candidate_count'], 2)
+        self.assertEqual(matching['combinations'], [])
+        self.assertIn('额度不足', matching['message'])
         self.call('POST', '/api/batches', {'name': '类别冲突', 'invoice_ids': [other['id']], 'quota_id': quota['id']}, status=400)
         batch = self.batch([first], quota_id=quota['id'])
         active = self.state()['quotas'][0]

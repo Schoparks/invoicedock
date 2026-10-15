@@ -475,11 +475,12 @@ def quota_for_scope(db, quota_id, user_id, group_id):
 @app.post('/api/match')
 def match(values: dict, user: dict = Depends(require_user)):
     target = cents(values.get('target_cents'), maximum=10_000_000)
+    quota = None
     with connection() as db:
         if values.get('quota_id'):
             quota = quota_for_scope(db, values['quota_id'], user['id'], values.get('group_id'))
             if target > quota['remaining_cents']:
-                fail('目标金额超过该月度额度的可用余额')
+                fail('额度不足：目标金额超过该月度额度的可用余额')
             category = values.get('category')
             if quota['category'] != '全部':
                 if category and category not in ('全部', quota['category']):
@@ -490,10 +491,17 @@ def match(values: dict, user: dict = Depends(require_user)):
         combos = best_combinations(invoices, target)
     except ValueError as exc:
         fail(str(exc))
+    message = ''
+    if not combos:
+        message = '额度不足：符合条件的可用发票总额低于目标金额，请补充发票或调整筛选条件。'
+    elif quota:
+        combos = [combo for combo in combos if combo['total_cents'] <= quota['remaining_cents']]
+        if not combos:
+            message = '额度不足：达到目标金额的发票组合超出剩余月度额度，请调整额度或筛选条件。'
     index = {i['id']: i for i in invoices}
     for combo in combos:
         combo['invoices'] = [index[i] for i in combo['invoice_ids']]
-    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target)
+    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target, message=message)
 
 
 @app.post('/api/batches')

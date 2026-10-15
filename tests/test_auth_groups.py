@@ -104,6 +104,112 @@ class AuthGroupTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(response.headers['Retry-After'], '900')
 
+    def login_client(self, email=None, password='a-long-secret-passphrase'):
+        client = TestClient(self.app)
+        self.addCleanup(client.close)
+        response = client.post('/api/auth/login', json={'email': email or self.owner['email'], 'password': password})
+        self.assertEqual(response.status_code, 200, response.text)
+        return client
+
+    def test_chinese_display_name_can_change_and_repeat_but_cannot_login(self):
+        other, member = self.account()
+        second_session = self.login_client()
+        original_token = self.owner_client.cookies.get(auth.COOKIE_NAME)
+        response = self.owner_client.patch('/api/auth/profile', json={
+            'name': '  中文用户名  ', 'current_password': 'a-long-secret-passphrase'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user'], {**self.owner, 'name': '中文用户名'})
+        self.assertEqual(self.owner_client.cookies.get(auth.COOKIE_NAME), original_token)
+        self.assertEqual(second_session.get('/api/auth/status').json()['user']['name'], '中文用户名')
+        response = other.patch('/api/auth/profile', json={'name': '中文用户名', 'current_password': 'a-long-secret-passphrase'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user']['id'], member['id'])
+        for payload in ({'email': '中文用户名'}, {'username': '中文用户名'}):
+            response = second_session.post('/api/auth/login', json={**payload, 'password': 'a-long-secret-passphrase'})
+            self.assertEqual(response.status_code, 400, response.text)
+        self.owner_client.post('/api/auth/logout')
+        self.assertEqual(self.owner_client.post('/api/auth/login', json={
+            'email': self.owner['email'], 'password': 'a-long-secret-passphrase'}).status_code, 200)
+
+    def test_profile_validation_requires_password_and_rejects_taken_email_atomically(self):
+        _, member = self.account()
+        for payload, status in [
+            ({'name': '新名字'}, 400),
+            ({'name': '新名字', 'current_password': 'wrong-password'}, 403),
+            ({'email': 'invalid', 'current_password': 'a-long-secret-passphrase'}, 400),
+            ({'name': '不能保存', 'email': member['email'].upper(), 'current_password': 'a-long-secret-passphrase'}, 409),
+        ]:
+            response = self.owner_client.patch('/api/auth/profile', json=payload)
+            self.assertEqual(response.status_code, status, response.text)
+            self.assertEqual(self.owner_client.get('/api/auth/status').json()['user'], self.owner)
+        for name in ('', '字' * 81, '换\n行', None):
+            response = self.owner_client.patch('/api/auth/profile', json={'name': name, 'current_password': 'a-long-secret-passphrase'})
+            self.assertEqual(response.status_code, 400, response.text)
+
+    def test_email_change_rotates_sessions_and_preserves_ownership(self):
+        group = self.group()
+        invoice = self.invoice(self.owner)
+        other, _ = self.account()
+        second_session = self.login_client()
+        original_token = self.owner_client.cookies.get(auth.COOKIE_NAME)
+        response = self.owner_client.patch('/api/auth/profile', json={
+            'email': ' New-Email@Example.Test ', 'current_password': 'a-long-secret-passphrase'})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user'], {**self.owner, 'email': 'new-email@example.test'})
+        self.assertNotEqual(self.owner_client.cookies.get(auth.COOKIE_NAME), original_token)
+        self.assertIsNone(second_session.get('/api/auth/status').json()['user'])
+        self.assertIsNotNone(other.get('/api/auth/status').json()['user'])
+        self.assertEqual(self.owner_client.get('/api/groups').json()[0]['id'], group['id'])
+        with db.connection() as connection:
+            self.assertEqual(connection.execute('SELECT owner_id FROM invoices WHERE id=?', (invoice,)).fetchone()[0], self.owner['id'])
+        self.assertEqual(second_session.post('/api/auth/login', json={
+            'email': self.owner['email'], 'password': 'a-long-secret-passphrase'}).status_code, 401)
+        self.assertEqual(second_session.post('/api/auth/login', json={
+            'email': 'new-email@example.test', 'password': 'a-long-secret-passphrase'}).status_code, 200)
+
+    def test_password_change_rejects_invalid_passwords_and_revokes_other_sessions(self):
+        second_session = self.login_client()
+        original_token = self.owner_client.cookies.get(auth.COOKIE_NAME)
+        for payload, status in [
+            ({'new_password': 'another-long-secret'}, 400),
+            ({'current_password': 'wrong-password', 'new_password': 'another-long-secret'}, 403),
+            ({'current_password': 'a-long-secret-passphrase', 'new_password': 'short'}, 400),
+        ]:
+            response = self.owner_client.post('/api/auth/password', json=payload)
+            self.assertEqual(response.status_code, status, response.text)
+            self.assertIsNotNone(second_session.get('/api/auth/status').json()['user'])
+        new_password = ' 新的中文密码 12345 '
+        response = self.owner_client.post('/api/auth/password', json={
+            'current_password': 'a-long-secret-passphrase', 'new_password': new_password})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['user'], self.owner)
+        self.assertNotEqual(self.owner_client.cookies.get(auth.COOKIE_NAME), original_token)
+        self.assertIsNone(second_session.get('/api/auth/status').json()['user'])
+        self.assertEqual(second_session.post('/api/auth/login', json={
+            'email': self.owner['email'], 'password': 'a-long-secret-passphrase'}).status_code, 401)
+        self.assertEqual(second_session.post('/api/auth/login', json={
+            'email': self.owner['email'], 'password': new_password}).status_code, 200)
+        with db.connection() as connection:
+            encoded = connection.execute('SELECT password_hash FROM users WHERE id=?', (self.owner['id'],)).fetchone()[0]
+            self.assertNotIn(new_password, encoded)
+            self.assertTrue(auth.verify_password(new_password, encoded))
+
+    def test_account_changes_require_login_and_share_password_attempt_limit(self):
+        anonymous = TestClient(self.app)
+        self.addCleanup(anonymous.close)
+        self.assertEqual(anonymous.patch('/api/auth/profile', json={'name': '中文'}).status_code, 401)
+        self.assertEqual(anonymous.post('/api/auth/password', json={'new_password': 'another-long-secret'}).status_code, 401)
+        for n in range(10):
+            if n % 2:
+                response = self.owner_client.patch('/api/auth/profile', json={'name': '中文', 'current_password': 'wrong-password'})
+            else:
+                response = self.owner_client.post('/api/auth/password', json={'new_password': 'another-long-secret', 'current_password': 'wrong-password'})
+            self.assertEqual(response.status_code, 403, response.text)
+        response = self.owner_client.patch('/api/auth/profile', json={'name': '中文', 'current_password': 'a-long-secret-passphrase'})
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.headers['Retry-After'], '900')
+        self.assertEqual(self.owner_client.get('/api/auth/status').json()['user'], self.owner)
+
     def test_invites_are_single_use_and_only_owner_can_manage_admins(self):
         group = self.group()
         member_client, member = self.account()

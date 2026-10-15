@@ -7,9 +7,10 @@ import re
 import secrets
 import time
 import uuid
+import unicodedata
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from .db import LOCK, connection
 
@@ -58,6 +59,15 @@ def _email(value):
     return value
 
 
+def _name(value):
+    if not isinstance(value, str):
+        raise HTTPException(400, '用户名须为 1 至 80 个字符')
+    value = value.strip()
+    if not 1 <= len(value) <= 80 or any(unicodedata.category(c).startswith('C') for c in value):
+        raise HTTPException(400, '用户名须为 1 至 80 个字符，不能包含控制字符')
+    return value
+
+
 def _password(value, registering=False):
     if not isinstance(value, str) or not 1 <= len(value) <= 128:
         raise HTTPException(400, '密码长度应为 10 至 128 个字符' if registering else '邮箱或密码不正确')
@@ -66,11 +76,11 @@ def _password(value, registering=False):
     return value
 
 
-def _rate_limit(request, email, registration=False):
+def _rate_limit(request, identity, registration=False, purpose='login'):
     stamp = int(time.time())
     address = request.client.host if request.client else 'unknown'
     # Each bucket is hashed so the limiter does not create an extra email/IP log.
-    rules = [('register-ip:' + address, 10)] if registration else [('login-ip:' + address, 60), ('login-email:' + email, 10)]
+    rules = [('register-ip:' + address, 10)] if registration else [(purpose + '-ip:' + address, 60), (purpose + '-identity:' + identity, 10)]
     with LOCK, connection(write=True) as db:
         db.execute('DELETE FROM auth_attempts WHERE window_start<?', (stamp - 900,))
         for value, limit in rules:
@@ -132,16 +142,14 @@ def register(values: dict, request: Request, response: Response):
         raise HTTPException(403, '注册已关闭，请联系服务维护者')
     email = _email(values.get('email'))
     password = _password(values.get('password'), registering=True)
-    name = values.get('name', '')
-    if not isinstance(name, str) or not 1 <= len(name.strip()) <= 80:
-        raise HTTPException(400, '姓名须为 1 至 80 个字符')
+    name = _name(values.get('name', ''))
     _rate_limit(request, email, registration=True)
     encoded = password_hash(password)
     with LOCK, connection(write=True) as db:
         if db.execute('SELECT 1 FROM users WHERE email=?', (email,)).fetchone():
             raise HTTPException(409, '该邮箱已注册，请登录')
         first = db.execute('SELECT 1 FROM users LIMIT 1').fetchone() is None
-        user = {'id': uuid.uuid4().hex, 'email': email, 'name': name.strip()}
+        user = {'id': uuid.uuid4().hex, 'email': email, 'name': name}
         db.execute('INSERT INTO users VALUES (?,?,?,?,?)', (user['id'], email, user['name'], encoded, datetime.now(timezone.utc).isoformat()))
         if first and _may_claim_legacy(request):
             for table in ('invoices', 'projects', 'quotas', 'batches'):
@@ -155,14 +163,68 @@ def login(values: dict, request: Request, response: Response):
     email = _email(values.get('email'))
     password = _password(values.get('password'))
     _rate_limit(request, email)
-    with connection() as db:
-        row = db.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
-    if not verify_password(password, row['password_hash'] if row else ''):
-        raise HTTPException(401, '邮箱或密码不正确')
     with LOCK, connection(write=True) as db:
-        db.execute('DELETE FROM auth_attempts WHERE bucket=?', (_token_hash('login-email:' + email),))
+        row = db.execute('SELECT * FROM users WHERE email=?', (email,)).fetchone()
+        if not verify_password(password, row['password_hash'] if row else ''):
+            raise HTTPException(401, '邮箱或密码不正确')
+        db.execute('DELETE FROM auth_attempts WHERE bucket=?', (_token_hash('login-identity:' + email),))
         _start_session(db, request, response, row['id'])
     return {'user': _public_user(row)}
+
+
+def _account_password(values, request, user_id):
+    _rate_limit(request, user_id, purpose='account')
+    password = values.get('current_password')
+    if not isinstance(password, str) or not 1 <= len(password) <= 128:
+        raise HTTPException(400, '请填写当前密码（最多 128 个字符）')
+    return password
+
+
+def _checked_account(db, request, user_id, password):
+    # Recheck the session inside the write transaction so a revoked request cannot
+    # change credentials after a concurrent password/email update.
+    row = db.execute("""SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id
+        WHERE u.id=? AND s.token_hash=? AND s.expires_at>?""",
+        (user_id, _token_hash(request.cookies.get(COOKIE_NAME, '')), int(time.time()))).fetchone()
+    if row is None:
+        raise HTTPException(401, '请先登录')
+    if not verify_password(password, row['password_hash']):
+        raise HTTPException(403, '当前密码不正确')
+    return row
+
+
+def _finish_account_update(db, request, response, user_id, renew=False):
+    db.execute('DELETE FROM auth_attempts WHERE bucket=?', (_token_hash('account-identity:' + user_id),))
+    if renew:
+        db.execute('DELETE FROM sessions WHERE user_id=?', (user_id,))
+        _start_session(db, request, response, user_id)
+    return {'user': _public_user(db.execute('SELECT * FROM users WHERE id=?', (user_id,)).fetchone())}
+
+
+@router.patch('/api/auth/profile')
+def update_profile(values: dict, request: Request, response: Response, user=Depends(require_user)):
+    if not any(key in values for key in ('name', 'email')):
+        raise HTTPException(400, '请提供要修改的用户名或邮箱')
+    name = _name(values['name']) if 'name' in values else None
+    email = _email(values['email']) if 'email' in values else None
+    password = _account_password(values, request, user['id'])
+    with LOCK, connection(write=True) as db:
+        row = _checked_account(db, request, user['id'], password)
+        if email and db.execute('SELECT 1 FROM users WHERE email=? AND id!=?', (email, user['id'])).fetchone():
+            raise HTTPException(409, '该邮箱已被其他账号使用')
+        db.execute('UPDATE users SET name=?,email=? WHERE id=?',
+                   (name if name is not None else row['name'], email or row['email'], user['id']))
+        return _finish_account_update(db, request, response, user['id'], renew=email is not None and email != row['email'])
+
+
+@router.post('/api/auth/password')
+def change_password(values: dict, request: Request, response: Response, user=Depends(require_user)):
+    new_password = _password(values.get('new_password'), registering=True)
+    password = _account_password(values, request, user['id'])
+    with LOCK, connection(write=True) as db:
+        _checked_account(db, request, user['id'], password)
+        db.execute('UPDATE users SET password_hash=? WHERE id=?', (password_hash(new_password), user['id']))
+        return _finish_account_update(db, request, response, user['id'], renew=True)
 
 
 @router.post('/api/auth/logout')

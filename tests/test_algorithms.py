@@ -18,7 +18,7 @@ class MatchingTests(unittest.TestCase):
         self.assertEqual(len({frozenset(row["invoice_ids"]) for row in results}), len(results))
         for result in results:
             self.assertEqual(len(result["invoice_ids"]), len(set(result["invoice_ids"])))
-            self.assertLessEqual(result["total_cents"], 1000)
+            self.assertGreaterEqual(result["total_cents"], 1000)
 
     def test_first_result_matches_exhaustive_subsets(self):
         rng = random.Random(27)
@@ -26,14 +26,40 @@ class MatchingTests(unittest.TestCase):
             values = [rng.randint(1, 70) for _ in range(9)]
             target = rng.randint(1, 230)
             invoices = [{"id": i, "amount_cents": value} for i, value in enumerate(values)]
-            expected = max(sum(value for value, use in zip(values, choice) if use)
-                           for choice in itertools.product((False, True), repeat=len(values))
-                           if sum(value for value, use in zip(values, choice) if use) <= target)
+            expected = min((sum(value for value, use in zip(values, choice) if use)
+                            for choice in itertools.product((False, True), repeat=len(values))
+                            if sum(value for value, use in zip(values, choice) if use) >= target), default=0)
             result = best_combinations(invoices, target, limit=1)
             actual = result[0]["total_cents"] if result else 0
             self.assertEqual(actual, expected)
             if result:
                 self.assertEqual(sum(values[i] for i in result[0]["invoice_ids"]), expected)
+
+    def test_closest_at_or_above_target(self):
+        cases = [
+            ([700, 400, 1500], 1000, 1100),
+            ([1100], 1000, 1100),
+            ([600, 600, 1100], 1000, 1100),
+            ([601, 400, 1100], 1000, 1001),
+            ([600, 600, 1101], 1000, 1101),
+            ([600, 600], 1000, 1200),
+            ([100_000_000, 601, 400], 1000, 1001),
+            ([100_000_000], 1, 100_000_000),
+            ([400, 599], 1000, 0),
+            ([], 1000, 0),
+            ([100], 0, 0),
+        ]
+        for values, target, expected in cases:
+            with self.subTest(values=values, target=target):
+                invoices = [{"id": i, "amount_cents": value} for i, value in enumerate(values)]
+                result = best_combinations(invoices, target)
+                self.assertEqual(result[0]["total_cents"] if result else 0, expected)
+                self.assertEqual([row["total_cents"] for row in result],
+                                 sorted(row["total_cents"] for row in result))
+                for row in result:
+                    self.assertGreaterEqual(row["total_cents"], target)
+                    self.assertEqual(row["gap_cents"], target - row["total_cents"])
+                    self.assertEqual(sum(values[i] for i in row["invoice_ids"]), row["total_cents"])
 
     def test_limits_and_nonpositive(self):
         self.assertEqual(best_combinations([{"id": 1, "amount_cents": 0}, {"id": 2, "amount_cents": -10}], 100), [])

@@ -1,4 +1,4 @@
-"""用整数分计算不超过目标金额的 0/1 发票组合。
+"""用整数分计算达到目标金额且超出最少的 0/1 发票组合。
 
 首组保证总额最优；其余组通过有限次数排除首组选中票生成，供用户比较，
 不承诺是全部组合中的全局第二、第三名。未使用金额舍入或近似搜索。
@@ -15,8 +15,18 @@ MAX_TARGET_CENTS = 10_000_000
 def _solve(items: list[tuple[object, int]], target: int) -> tuple[list[object], int]:
     if not items or target <= 0:
         return [], 0
+    # 达标的大额单票单独比较，避免按其票面金额分配 bitset。
+    single = min((item for item in items if item[1] >= target),
+                 key=lambda item: item[1], default=None)
+    items = [item for item in items if item[1] < target]
+    if sum(amount for _, amount in items) < target:
+        return ([single[0]], single[1]) if single else ([], 0)
+    # 小额票首次跨过目标时，合计至多为 target + 最大票额 - 1。
+    upper = target + max(amount for _, amount in items) - 1
+    if single:
+        upper = min(upper, single[1])
     scale = reduce(gcd, (amount for _, amount in items))
-    capacity = target // scale
+    capacity = upper // scale
     weights = [amount // scale for _, amount in items]
     mask = (1 << (capacity + 1)) - 1
     # 块检查点与块内回溯都仅保留 O(sqrt(n)) 个 bitset。
@@ -27,7 +37,11 @@ def _solve(items: list[tuple[object, int]], target: int) -> tuple[list[object], 
         reachable |= (reachable << weight) & mask
         if (index + 1) % block == 0:
             checkpoints.append(reachable)
-    best = reachable.bit_length() - 1
+    minimum = (target + scale - 1) // scale
+    above = reachable >> minimum
+    if not above:
+        return ([single[0]], single[1]) if single else ([], 0)
+    best = minimum + (above & -above).bit_length() - 1
     remaining = best
     selected = []
     end = len(items)
@@ -51,7 +65,7 @@ def _solve(items: list[tuple[object, int]], target: int) -> tuple[list[object], 
 def best_combinations(
     invoices: list[dict], target_cents: int, limit: int = 3
 ) -> list[dict]:
-    """返回 invoice_ids / total_cents / gap_cents；首组金额最大且不超额。"""
+    """返回 invoice_ids / total_cents / gap_cents；首组合计不少于目标且超出最少；gap_cents 为目标减合计。"""
     if isinstance(target_cents, bool) or not isinstance(target_cents, int):
         raise ValueError("目标金额必须为整数分")
     if not 0 <= target_cents <= MAX_TARGET_CENTS:
@@ -76,8 +90,7 @@ def best_combinations(
         if invoice_id in seen_ids:
             raise ValueError("候选发票编号重复")
         seen_ids.add(invoice_id)
-        if amount <= target_cents:
-            candidates.append((invoice_id, amount))
+        candidates.append((invoice_id, amount))
     first_ids, first_total = _solve(candidates, target_cents)
     if not first_ids:
         return []
@@ -101,5 +114,5 @@ def best_combinations(
         # 同额组合已经达到最优，无须为了凑齐搜索次数继续计算。
         if sum(item["total_cents"] == first_total for item in alternatives) >= limit - 1:
             break
-    alternatives.sort(key=lambda item: item["total_cents"], reverse=True)
+    alternatives.sort(key=lambda item: item["total_cents"])
     return results + alternatives[:limit - 1]
