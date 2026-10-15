@@ -113,7 +113,12 @@ def quota_dict(db, row):
 
 def batch_dict(db, row):
     item = dict(row)
-    item['items'] = [json.loads(r['snapshot']) for r in db.execute('SELECT snapshot FROM batch_items WHERE batch_id=? ORDER BY rowid', (item['id'],))]
+    item['items'] = []
+    for entry in db.execute('SELECT b.snapshot,i.file_path,i.file_name FROM batch_items b JOIN invoices i ON i.id=b.invoice_id WHERE b.batch_id=? ORDER BY b.rowid', (item['id'],)):
+        invoice = json.loads(entry['snapshot'])
+        invoice['file_url'] = f"/api/batches/{item['id']}/invoices/{invoice['id']}/file" if entry['file_path'] else ''
+        invoice['original_file_name'] = entry['file_name']
+        item['items'].append(invoice)
     item['invoice_ids'] = [r['id'] for r in item['items']]
     return item
 
@@ -398,18 +403,72 @@ def import_files(files: list[UploadFile] = File(...), group_id: str | None = Non
     return result
 
 
+def safe_filename(value, fallback='原件', max_bytes=180):
+    value = re.sub(r'[/\\:*?"<>|\x00-\x1f\x7f]', '_', str(value or '')).strip(' .')
+    value = value.encode('utf-8')[:max_bytes].decode('utf-8', errors='ignore').rstrip(' .')
+    return value or fallback
+
+
+def original_filename(row, snapshot=None, sequence=None, rename=False, filename=None):
+    suffix = Path(row['file_path']).suffix.lower() if rename or filename is not None else Path(row['file_name']).suffix
+    if filename is not None:
+        if not isinstance(filename, str) or not filename.strip() or len(filename.encode('utf-8')) > 180 or safe_filename(filename) != filename:
+            fail('文件名不能为空、不能超过 180 字节或包含 /\\:*?"<>| 等特殊字符及首尾空格、句点')
+        stem = filename
+    elif rename:
+        invoice = snapshot if snapshot is not None else row
+        amount = int(invoice.get('amount_cents') or 0)
+        stem = (f'{sequence:03}-' if sequence is not None else '') + safe_filename(invoice.get('category'), '其他') + f'-{amount // 100}.{amount % 100:02}'
+    else:
+        stem = safe_filename(Path(row['file_name']).stem)
+    return stem + suffix
+
+
+def original_response(row, download_file=False, filename=None, preview_page=None):
+    if not row['file_path'] or not (DATA / row['file_path']).is_file():
+        fail('此记录没有原件', 404)
+    if preview_page is not None:
+        if preview_page < 1 or Path(row['file_path']).suffix.lower() != '.pdf':
+            fail('请选择有效的 PDF 页码')
+        import pymupdf
+        try:
+            with pymupdf.open(DATA / row['file_path']) as document:
+                if document.needs_pass:
+                    fail('此 PDF 已加密，请下载原件查看')
+                if preview_page > document.page_count:
+                    fail('PDF 页码超出范围')
+                page = document.load_page(preview_page - 1)
+                scale = min(2, 2000 / max(page.rect.width, page.rect.height))
+                image = page.get_pixmap(matrix=pymupdf.Matrix(scale, scale), alpha=False)
+                return Response(image.tobytes('png'), media_type='image/png', headers={'X-Preview-Pages': str(document.page_count)})
+        except (RuntimeError, ValueError):
+            fail('PDF 无法预览，请下载原件查看')
+    types = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.xml': 'application/xml'}
+    mime = types.get(Path(row['file_path']).suffix.lower())
+    name = original_filename(row, filename=filename) if download_file else row['file_name']
+    return FileResponse(DATA / row['file_path'], media_type=mime or 'application/octet-stream', filename=name,
+                        content_disposition_type='attachment' if download_file or not mime else 'inline')
+
+
 @app.get('/api/invoices/{invoice_id}/file')
-def original_file(invoice_id: str, user: dict = Depends(require_user)):
+def original_file(invoice_id: str, download: bool = False, preview_page: int | None = None, user: dict = Depends(require_user)):
     with connection() as db:
         row = fetch(db, 'invoices', invoice_id)
         shared = db.execute('SELECT 1 FROM invoice_shares s JOIN group_members m ON m.group_id=s.group_id WHERE s.invoice_id=? AND m.user_id=?', (invoice_id,user['id'])).fetchone()
         if row['owner_id'] != user['id'] and not shared:
             fail('无权查看此原件', 403)
-    if not row['file_path'] or not (DATA / row['file_path']).is_file():
-        fail('此记录没有原件', 404)
-    types = {'.pdf': 'application/pdf', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
-    mime = types.get(Path(row['file_path']).suffix)
-    return FileResponse(DATA / row['file_path'], media_type=mime or 'application/octet-stream', filename=row['file_name'], content_disposition_type='inline' if mime else 'attachment')
+    return original_response(row, download, preview_page=preview_page)
+
+
+@app.get('/api/batches/{batch_id}/invoices/{invoice_id}/file')
+def batch_original_file(batch_id: str, invoice_id: str, download: bool = False, filename: str | None = None, preview_page: int | None = None, user: dict = Depends(require_user)):
+    with connection() as db:
+        batch = fetch(db, 'batches', batch_id)
+        authorize_scope(db, batch, user['id'])
+        if not db.execute('SELECT 1 FROM batch_items WHERE batch_id=? AND invoice_id=?', (batch_id, invoice_id)).fetchone():
+            fail('此发票不在报销单中', 404)
+        row = fetch(db, 'invoices', invoice_id)
+    return original_response(row, download, filename, preview_page)
 
 
 @app.post('/api/projects')
@@ -475,11 +534,14 @@ def quota_for_scope(db, quota_id, user_id, group_id):
 @app.post('/api/match')
 def match(values: dict, user: dict = Depends(require_user)):
     target = cents(values.get('target_cents'), maximum=10_000_000)
+    direction = values.get('direction', 'above')
+    if direction not in ('above', 'below'):
+        fail('匹配方式须为稍多或稍少')
     quota = None
     with connection() as db:
         if values.get('quota_id'):
             quota = quota_for_scope(db, values['quota_id'], user['id'], values.get('group_id'))
-            if target > quota['remaining_cents']:
+            if direction == 'above' and target > quota['remaining_cents']:
                 fail('额度不足：目标金额超过该月度额度的可用余额')
             category = values.get('category')
             if quota['category'] != '全部':
@@ -488,20 +550,25 @@ def match(values: dict, user: dict = Depends(require_user)):
                 values = {**values, 'category': quota['category']}
         invoices = candidates(db, values, user['id'])
     try:
-        combos = best_combinations(invoices, target)
+        search_target = min(target, quota['remaining_cents']) if quota and direction == 'below' else target
+        combos = best_combinations(invoices, search_target, direction=direction)
     except ValueError as exc:
         fail(str(exc))
     message = ''
     if not combos:
-        message = '额度不足：符合条件的可用发票总额低于目标金额，请补充发票或调整筛选条件。'
-    elif quota:
+        if direction == 'below':
+            message = '没有不超过目标金额且符合剩余额度的可用发票组合，请调整金额或筛选条件。' if quota else '没有不超过目标金额的可用发票组合，请调整金额或筛选条件。'
+        else:
+            message = '额度不足：符合条件的可用发票总额低于目标金额，请补充发票或调整筛选条件。'
+    elif quota and direction == 'above':
         combos = [combo for combo in combos if combo['total_cents'] <= quota['remaining_cents']]
         if not combos:
             message = '额度不足：达到目标金额的发票组合超出剩余月度额度，请调整额度或筛选条件。'
     index = {i['id']: i for i in invoices}
     for combo in combos:
+        combo['gap_cents'] = target - combo['total_cents']
         combo['invoices'] = [index[i] for i in combo['invoice_ids']]
-    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target, message=message)
+    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target, direction=direction, message=message)
 
 
 @app.post('/api/batches')
@@ -607,27 +674,55 @@ def export_library(group_id: str | None = None, user: dict = Depends(require_use
 
 @app.get('/api/batches/{batch_id}/export')
 def export_batch(batch_id: str, user: dict = Depends(require_user)):
+    return build_batch_export(batch_id, user)
+
+
+@app.post('/api/batches/{batch_id}/export')
+def export_batch_options(batch_id: str, values: dict, user: dict = Depends(require_user)):
+    rename = values.get('rename', False)
+    originals_only = values.get('originals_only', False)
+    filenames = values.get('filenames', {})
+    if type(rename) is not bool or type(originals_only) is not bool or not isinstance(filenames, dict) or any(not isinstance(value, str) for value in filenames.values()):
+        fail('下载选项格式不正确')
+    return build_batch_export(batch_id, user, originals_only, rename, filenames if rename else {})
+
+
+def build_batch_export(batch_id, user, originals_only=False, rename=False, filenames=None):
+    filenames = filenames or {}
     with LOCK, connection() as db:
         row = fetch(db, 'batches', batch_id)
         authorize_scope(db, row, user['id'])
         batch = batch_dict(db, row)
+        if any(key not in batch['invoice_ids'] for key in filenames):
+            fail('文件名包含不属于此报销单的发票')
         projects = {r['id']: r['name'] for r in scoped_rows(db, 'projects', user['id'], row.get('group_id'))}
         temporary = tempfile.TemporaryDirectory(prefix='invoice-export-')
         zip_path = Path(temporary.name) / 'export.zip'
-        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
-            export_items = [{**i, 'status': batch['status']} for i in batch['items']]
-            archive.writestr('发票明细.xlsx', workbook_bytes(export_items, projects))
-            archive.writestr('报销单.json', json.dumps(batch, ensure_ascii=False, indent=2))
-            missing = []
-            for n, invoice_id in enumerate(batch['invoice_ids'], 1):
-                row = fetch(db, 'invoices', invoice_id)
-                if row['file_path'] and (DATA / row['file_path']).is_file():
-                    archive.write(DATA / row['file_path'], f"原件/{n:03}_{Path(row['file_name']).name}")
-                else:
-                    missing.append(row['seller'] or row['number'] or invoice_id)
-            if missing:
-                archive.writestr('无原件记录.txt', '以下记录为手工录入或无原件：\n' + '\n'.join(missing))
-    name = re.sub(r'[/\\\x00-\x1f]', '_', batch['name'])
+        try:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as archive:
+                if not originals_only:
+                    export_items = [{**i, 'status': batch['status']} for i in batch['items']]
+                    archive.writestr('发票明细.xlsx', workbook_bytes(export_items, projects))
+                    archive.writestr('报销单.json', json.dumps(batch, ensure_ascii=False, indent=2))
+                missing, used_names = [], set()
+                for n, snapshot in enumerate(batch['items'], 1):
+                    row = fetch(db, 'invoices', snapshot['id'])
+                    if row['file_path'] and (DATA / row['file_path']).is_file():
+                        name = original_filename(row, snapshot, n, rename, filenames.get(snapshot['id']))
+                        candidate, duplicate = name, 1
+                        while candidate.casefold() in used_names:
+                            duplicate += 1
+                            candidate = f'{Path(name).stem}-{duplicate}{Path(name).suffix}'
+                        used_names.add(candidate.casefold())
+                        archive.write(DATA / row['file_path'], '原件/' + candidate)
+                    else:
+                        missing.append(f"{n:03}_" + (snapshot['seller'] or snapshot['number'] or snapshot['id']))
+                if missing:
+                    archive.writestr('无原件记录.txt', '以下记录为手工录入或无原件：\n' + '\n'.join(missing))
+        except BaseException:
+            temporary.cleanup()
+            raise
+    name = safe_filename(batch['name'], '报销单') + ('_原件' if originals_only else '')
     return FileResponse(zip_path, filename=name + '.zip', media_type='application/zip', background=BackgroundTask(temporary.cleanup))
 
 

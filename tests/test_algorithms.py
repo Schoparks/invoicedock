@@ -26,14 +26,17 @@ class MatchingTests(unittest.TestCase):
             values = [rng.randint(1, 70) for _ in range(9)]
             target = rng.randint(1, 230)
             invoices = [{"id": i, "amount_cents": value} for i, value in enumerate(values)]
-            expected = min((sum(value for value, use in zip(values, choice) if use)
-                            for choice in itertools.product((False, True), repeat=len(values))
-                            if sum(value for value, use in zip(values, choice) if use) >= target), default=0)
-            result = best_combinations(invoices, target, limit=1)
-            actual = result[0]["total_cents"] if result else 0
-            self.assertEqual(actual, expected)
-            if result:
-                self.assertEqual(sum(values[i] for i in result[0]["invoice_ids"]), expected)
+            totals = [sum(value for value, use in zip(values, choice) if use)
+                      for choice in itertools.product((False, True), repeat=len(values))]
+            for direction in ("above", "below"):
+                with self.subTest(direction=direction, target=target, values=values):
+                    expected = (min((total for total in totals if total >= target), default=0)
+                                if direction == "above" else max(total for total in totals if total <= target))
+                    result = best_combinations(invoices, target, limit=1, direction=direction)
+                    actual = result[0]["total_cents"] if result else 0
+                    self.assertEqual(actual, expected)
+                    if result:
+                        self.assertEqual(sum(values[i] for i in result[0]["invoice_ids"]), expected)
 
     def test_closest_at_or_above_target(self):
         cases = [
@@ -61,7 +64,35 @@ class MatchingTests(unittest.TestCase):
                     self.assertEqual(row["gap_cents"], target - row["total_cents"])
                     self.assertEqual(sum(values[i] for i in row["invoice_ids"]), row["total_cents"])
 
+    def test_closest_at_or_below_target(self):
+        cases = [
+            ([700, 300, 299, 1001], 1000, 1000),
+            ([1000], 1000, 1000),
+            ([700, 299, 1001], 1000, 999),
+            ([600, 600], 1000, 600),
+            ([300], 1000, 300),
+            ([1001], 1000, 0),
+            ([1], 1, 1),
+            ([1], 0, 0),
+        ]
+        for values, target, expected in cases:
+            with self.subTest(values=values, target=target):
+                invoices = [{"id": i, "amount_cents": value} for i, value in enumerate(values)]
+                results = best_combinations(invoices, target, direction="below")
+                self.assertEqual(results[0]["total_cents"] if results else 0, expected)
+                self.assertEqual([row["total_cents"] for row in results],
+                                 sorted((row["total_cents"] for row in results), reverse=True))
+                self.assertEqual(len({frozenset(row["invoice_ids"]) for row in results}), len(results))
+                for row in results:
+                    self.assertLessEqual(row["total_cents"], target)
+                    self.assertGreater(row["total_cents"], 0)
+                    self.assertEqual(len(row["invoice_ids"]), len(set(row["invoice_ids"])))
+                    self.assertEqual(sum(values[i] for i in row["invoice_ids"]), row["total_cents"])
+                    self.assertEqual(row["gap_cents"], target - row["total_cents"])
+
     def test_limits_and_nonpositive(self):
+        with self.assertRaises(ValueError):
+            best_combinations([], 100, direction="invalid")
         self.assertEqual(best_combinations([{"id": 1, "amount_cents": 0}, {"id": 2, "amount_cents": -10}], 100), [])
         with self.assertRaises(ValueError):
             best_combinations([], 10_000_001)

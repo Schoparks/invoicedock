@@ -25,11 +25,13 @@ let scopeBusy = false;
 let selected = new Set();
 let filters = {q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
 let batchFilter = '';
-let matchValues = {target:'',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
+let matchValues = {target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
 let matchData = null;
 let modalBusy = false;
 let toastTimer;
 const modal = $('#modal');
+const preview = $('#original-preview');
+const originalViewers = new Map();
 
 function scopedURL(path) {
   if (!activeGroupId) return path;
@@ -50,7 +52,7 @@ async function api(path, options = {}) {
   if (!response.ok) {
     let data;
     try { data = await response.json(); } catch (_) { data = {}; }
-    if (response.status === 401 && currentUser) { currentUser=null;resetReceiptAddresses();modal.close();renderAuth(); }
+    if (response.status === 401 && currentUser) { currentUser=null;resetReceiptAddresses();preview.close();modal.close();renderAuth(); }
     throw new Error(typeof data.detail === 'string' ? data.detail : `请求未完成（${response.status}），请重试。`);
   }
   return response.status === 204 ? null : response.json();
@@ -105,6 +107,7 @@ function navigate() {
   renderPage();
 }
 function renderPage() {
+  document.body.classList.toggle('match-page',activePage==='match');
   $$('[data-page]').forEach(link => {
     const current = link.dataset.page === activePage;
     link.classList.toggle('active',current);
@@ -153,7 +156,7 @@ function updateInvoiceTable() {
     return;
   }
   const eligible = invoices.filter(i=>i.verified && i.status === 'available');
-  $('#invoice-table').innerHTML = `<div class="table-scroll"><table><thead><tr><th><input type="checkbox" id="select-all" aria-label="选中当前筛选下所有可报销发票" ${eligible.length && eligible.every(i=>selected.has(i.id))?'checked':''} ${!eligible.length?'disabled':''}></th><th>发票信息</th><th>类别 / 项目</th><th>开票日期</th><th class="align-right">价税合计</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody>${invoices.map(i=>`<tr><td><input type="checkbox" data-select="${esc(i.id)}" aria-label="选择 ${esc(i.seller || i.file_name || '发票')}" ${selected.has(i.id)?'checked':''} ${i.verified && i.status === 'available'?'':'disabled'}></td><td><button class="link-button invoice-title" data-action="edit-invoice" data-id="${esc(i.id)}" title="${esc(i.seller || i.file_name)}">${esc(i.seller || i.file_name || '待补充销售方')}</button><span class="invoice-sub number">${esc(i.number || '待补充发票号码')}</span></td><td><span class="tag">${esc(i.category || '其他')}</span><span class="invoice-sub">${esc(projectName(i.project_id))}${activeGroupId && i.owner_name?' · '+esc(i.owner_name):''}</span></td><td class="number text-muted">${esc(i.date || '待核对')}</td><td class="align-right money">¥ ${fmt(i.amount_cents)}</td><td>${invoiceBadge(i)}</td><td class="align-right"><button class="link-button" data-action="edit-invoice" data-id="${esc(i.id)}">${!i.verified && i.can_edit!==false?'去核对':'查看'}</button></td></tr>`).join('')}</tbody></table></div>`;
+  $('#invoice-table').innerHTML = `<div class="table-scroll"><table><thead><tr><th><input type="checkbox" id="select-all" aria-label="选中当前筛选下所有可报销发票" ${eligible.length && eligible.every(i=>selected.has(i.id))?'checked':''} ${!eligible.length?'disabled':''}></th><th>发票信息</th><th>类别 / 项目</th><th>开票日期</th><th class="align-right">价税合计</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody>${invoices.map(i=>`<tr><td><input type="checkbox" data-select="${esc(i.id)}" aria-label="选择 ${esc(i.seller || i.file_name || '发票')}" ${selected.has(i.id)?'checked':''} ${i.verified && i.status === 'available'?'':'disabled'}></td><td><button class="link-button invoice-title" data-action="edit-invoice" data-id="${esc(i.id)}" title="${esc(i.seller || i.file_name)}">${esc(i.seller || i.file_name || '待补充销售方')}</button><span class="invoice-sub number">${esc(i.number || '待补充发票号码')}</span></td><td><span class="tag">${esc(i.category || '其他')}</span><span class="invoice-sub">${esc(projectName(i.project_id))}${activeGroupId && i.owner_name?' · '+esc(i.owner_name):''}</span></td><td class="number text-muted">${esc(i.date || '待核对')}</td><td class="align-right money">¥ ${fmt(i.amount_cents)}</td><td>${invoiceBadge(i)}</td><td class="align-right"><div class="invoice-row-actions"><button class="link-button" data-action="preview-original" data-url="${esc(i.file_url)}" data-original-id="${esc(i.id)}" data-filename="${esc(i.file_name)}" ${i.file_url?'':'disabled title="此记录没有原件"'}>预览</button><button class="link-button" data-action="edit-invoice" data-id="${esc(i.id)}">${i.status==='available' && i.can_edit!==false?'核对':'查看'}</button></div></td></tr>`).join('')}</tbody></table></div>`;
 }
 function updateSelection() {
   const bar = $('#selection-bar');
@@ -163,14 +166,14 @@ function updateSelection() {
   bar.innerHTML = `<span>已选 ${selected.size} 张</span><button class="link-button" data-action="clear-selection">取消选择</button><strong>¥ ${fmt(total)}</strong><button class="btn primary small" data-action="create-selected">创建报销草稿</button>`;
 }
 function renderMatch() {
-  return heading('FIND THE RIGHT FIT','智能匹配','给出目标金额，找一组刚刚好的发票。') + `<div class="two-column"><section class="panel match-form"><div class="panel-header"><h2>设置匹配条件</h2></div><form data-form="match" class="panel-body form-stack"><label class="field wide"><span>目标金额（元）</span><div class="currency-input"><input class="target-input" name="target" inputmode="decimal" placeholder="0.00" value="${esc(matchValues.target)}" required autocomplete="off" aria-label="目标金额（元）"></div><small>最多 100,000 元，支持精确到分</small></label><label class="field"><span>发票类别</span><select name="category">${categoryOptions(matchValues.category)}</select></label><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(matchValues.project_id)}</select></label><div class="form-grid wide"><label class="field"><span>开票日期 · 从</span><input type="date" name="date_from" value="${esc(matchValues.date_from)}"></label><label class="field"><span>至</span><input type="date" name="date_to" value="${esc(matchValues.date_to)}"></label></div><label class="field wide"><span>发票抬头</span><input name="buyer" value="${esc(matchValues.buyer)}" placeholder="填写完整抬头，精确匹配"></label><label class="field wide"><span>月度报销额度</span><select name="quota_id">${quotaOptions(matchValues.quota_id)}</select><small>选择额度后，匹配金额受剩余额度约束。</small></label><div class="inline-error wide" data-error></div><button class="btn primary wide" type="submit">开始匹配 <span aria-hidden="true">→</span></button><p class="hint wide">仅使用已核对、未被报销单占用的发票。组合合计不少于目标金额，优先选择超出最少的方案。</p></form></section><section id="match-results" aria-live="polite">${renderMatchResults()}</section></div>`;
+  return heading('FIND THE RIGHT FIT','智能匹配','给出目标金额，找一组刚刚好的发票。') + `<div class="two-column match-layout"><section class="panel match-form" tabindex="0" aria-label="匹配条件"><div class="panel-header"><h2>设置匹配条件</h2></div><form data-form="match" class="panel-body form-stack"><label class="field wide"><span>目标金额（元）</span><div class="currency-input"><input class="target-input" name="target" inputmode="decimal" placeholder="0.00" value="${esc(matchValues.target)}" required autocomplete="off" aria-label="目标金额（元）"></div><small>最多 100,000 元，支持精确到分</small></label><fieldset class="match-direction wide" aria-describedby="match-direction-help"><legend>匹配方式</legend><div class="match-direction-options"><label><input type="radio" name="direction" value="above" ${matchValues.direction==='above'?'checked':''}>稍多</label><label><input type="radio" name="direction" value="below" ${matchValues.direction==='below'?'checked':''}>稍少</label></div><small id="match-direction-help">稍多：恰好或超出最少；稍少：恰好或低于且最接近目标。</small></fieldset><label class="field"><span>发票类别</span><select name="category">${categoryOptions(matchValues.category)}</select></label><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(matchValues.project_id)}</select></label><div class="form-grid wide"><label class="field"><span>开票日期 · 从</span><input type="date" name="date_from" value="${esc(matchValues.date_from)}"></label><label class="field"><span>至</span><input type="date" name="date_to" value="${esc(matchValues.date_to)}"></label></div><label class="field wide"><span>发票抬头</span><input name="buyer" value="${esc(matchValues.buyer)}" placeholder="填写完整抬头，精确匹配"></label><label class="field wide"><span>月度报销额度</span><select name="quota_id">${quotaOptions(matchValues.quota_id)}</select><small>选择额度后，匹配金额受剩余额度约束。</small></label><div class="inline-error wide" data-error></div><button class="btn primary wide" type="submit">开始匹配 <span aria-hidden="true">→</span></button><p class="hint wide">仅使用已核对、未被报销单占用的发票。</p></form></section><section id="match-results" aria-live="polite" tabindex="0" aria-label="匹配结果">${renderMatchResults()}</section></div>`;
 }
 function renderMatchResults() {
   if (!matchData) return `<div class="panel">${empty('让金额，刚好合适','填写目标金额与筛选条件，票栈会为你寻找可用发票组合。','','⌘')}</div>`;
-  if (!matchData.combinations?.length) return `<div class="panel">${empty('额度不足',`${esc(matchData.message)} 本次找到 ${matchData.candidate_count || 0} 张候选发票。`,'<a class="btn" href="#invoices">返回票库</a>','⌘')}</div>`;
-  return `<div class="list-head"><h2>可选组合</h2><span class="result-count">${matchData.candidate_count} 张候选 · ${matchData.combinations.length} 个方案</span></div>${matchData.combinations.map((combo,index)=>{
+  if (!matchData.combinations?.length) return `<div class="panel">${empty(matchData.direction==='below'?'暂无合适组合':'额度不足',`${esc(matchData.message)} 本次找到 ${matchData.candidate_count || 0} 张候选发票。`,'<a class="btn" href="#invoices">返回票库</a>','⌘')}</div>`;
+  return `<div class="list-head"><h2>可选组合</h2><span class="result-count">${matchData.candidate_count} 张候选 · ${matchData.direction==='below'?'稍少':'稍多'} · ${matchData.combinations.length} 个方案</span></div>${matchData.combinations.map((combo,index)=>{
     const gap = combo.total_cents - matchData.target_cents;
-    return `<article class="match-result"><div class="result-top"><div><h3>方案 ${String(index+1).padStart(2,'0')} ${gap===0?'<span class="badge available">精确匹配</span>':''}</h3><p>${gap===0?'金额刚好，正合所需':`超出目标 ¥${fmt(gap)}`}</p></div><div class="result-amount">¥ ${fmt(combo.total_cents)}</div></div><div class="mini-list">${combo.invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name || '未命名发票')}<div class="minor">${esc(i.date || '未填写日期')} · ${esc(i.category)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div><div class="result-footer"><span>${combo.invoice_ids.length} 张发票 · 创建后将被草稿占用</span><button class="btn primary small" data-action="use-combination" data-index="${index}">选择此组合</button></div></article>`;
+    return `<article class="match-result"><div class="result-top"><div><h3>方案 ${String(index+1).padStart(2,'0')} ${gap===0?'<span class="badge available">精确匹配</span>':''}</h3><p>${gap===0?'金额刚好，正合所需':`${gap>0?'超出':'低于'}目标 ¥${fmt(Math.abs(gap))}`}</p></div><div class="result-amount">¥ ${fmt(combo.total_cents)}</div></div><div class="mini-list">${combo.invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name || '未命名发票')}<div class="minor">${esc(i.date || '未填写日期')} · ${esc(i.category)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div><div class="result-footer"><span>${combo.invoice_ids.length} 张发票 · 创建后将被草稿占用</span><button class="btn primary small" data-action="use-combination" data-index="${index}">选择此组合</button></div></article>`;
   }).join('')}`;
 }
 function renderBatches() {
@@ -187,6 +190,8 @@ function renderData() {
   return heading('YOUR DATA, WITH YOU','数据管理','导出当前空间的发票账目，保存一份完整记录。') + `<div class="data-grid"><section class="data-card"><div class="data-icon" aria-hidden="true">▦</div><h2>导出票库台账</h2><p>将${activeGroupId?'当前群组共享':'个人'}发票的信息、金额、类别与报销状态导出为 Excel，方便查阅和进一步整理。</p><button class="btn primary" data-action="download" data-url="/api/export" data-filename="发票台账.xlsx">导出 Excel <span aria-hidden="true">↓</span></button><span class="file-type">.XLSX</span></section><section class="data-card"><div class="data-icon" aria-hidden="true">▣</div><h2>个人数据备份</h2><p>${activeGroupId?'完整备份仅在个人空间提供。切换到个人空间后，可以下载你自己的发票信息与原件。':'打包你自己的发票信息与原件，不包含其他用户的私人数据。建议定期备份到你信任的位置。'}</p>${activeGroupId?'<button class="btn" data-action="personal-space">切换到个人空间</button>':'<button class="btn" data-action="download" data-url="/api/backup" data-filename="票栈备份.zip">下载个人备份 <span aria-hidden="true">↓</span></button><span class="file-type">.ZIP</span>'}</section></div><div class="data-note"><strong>${activeGroupId?'当前群组':'你的个人空间'}</strong><br>共有 ${state.invoices.length} 张发票、${state.batches.length} 张报销单。个人发票仅本人可见；分享后的发票会对指定群组成员开放。${state.capabilities.ocr?'':' 图片和扫描件导入后需要手动补充信息。'}</div>`;
 }
 function openModal(title,subtitle,content,footer = '',formName = '',formData = '') {
+  cleanupOriginalViewers(modal);
+  modal.classList.toggle('invoice-dialog',formName==='invoice');
   modal.innerHTML = `<div class="modal-head"><div><h2 id="modal-title">${title}</h2>${subtitle?`<p>${subtitle}</p>`:''}</div><button class="icon-btn" data-action="close-modal" aria-label="关闭对话框">×</button></div>${formName?`<form data-form="${formName}" ${formData}>`:''}<div class="modal-body">${content}<div class="inline-error spaced" data-error></div></div>${footer?`<div class="modal-footer">${footer}</div>`:''}${formName?'</form>':''}`;
   if (!modal.open) modal.showModal();
   const focusTarget = $('input:not([type=hidden]):not(:disabled),select:not(:disabled),textarea:not(:disabled)',modal);
@@ -198,12 +203,14 @@ function invoiceModal(id) {
   const locked = i.id && (i.status !== 'available' || i.can_edit === false);
   const owned = !i.owner_id || i.owner_id === currentUser?.id;
   const disabled = locked?'disabled':'';
-  const fields = `<div class="form-grid"><label class="field wide"><span>销售方</span><input name="seller" value="${esc(i.seller)}" placeholder="票面销售方名称" maxlength="200" ${disabled}></label><label class="field wide"><span>购买方 / 发票抬头</span><input name="buyer" value="${esc(i.buyer)}" placeholder="票面购买方名称" maxlength="200" ${disabled}></label><label class="field"><span>发票号码</span><input name="number" value="${esc(i.number)}" placeholder="保留完整号码" maxlength="100" ${disabled}></label><label class="field"><span>开票日期</span><input type="date" name="date" value="${esc(i.date)}" ${disabled}></label><label class="field"><span>价税合计（元）</span><input name="amount" value="${i.amount_cents?(i.amount_cents/100).toFixed(2):''}" inputmode="decimal" placeholder="0.00" ${disabled}></label><label class="field"><span>类别</span><select name="category" ${disabled}>${categories.map(c=>`<option ${c===i.category?'selected':''}>${c}</option>`).join('')}</select></label><label class="field wide"><span>所属项目</span><select name="project_id" ${disabled}>${projectOptions(i.project_id,'未分配项目')}</select></label><label class="field wide"><span>备注</span><textarea name="note" maxlength="1000" placeholder="用途、行程或其他说明" ${disabled}>${esc(i.note)}</textarea></label><label class="check-label wide"><input type="checkbox" name="verified" ${i.verified?'checked':''} ${disabled}><span>我已核对销售方、开票日期、金额等票面信息，确认这张发票可用于报销。</span></label></div>`;
-  const original = i.file_url?`<div class="original-link"><span>${esc(i.file_name || '发票原件')}</span><a class="btn small" target="_blank" rel="noopener" href="${esc(i.file_url)}">打开原件 ↗</a></div>`:'';
+  const fields = `<div class="form-grid"><label class="field wide"><span>销售方</span><input name="seller" value="${esc(i.seller)}" placeholder="票面销售方名称" maxlength="200" ${disabled}></label><label class="field wide"><span>购买方 / 发票抬头</span><input name="buyer" value="${esc(i.buyer)}" placeholder="票面购买方名称" maxlength="200" ${disabled}></label><label class="field"><span>发票号码</span><input name="number" value="${esc(i.number)}" placeholder="保留完整号码" maxlength="100" ${disabled}></label><label class="field"><span>开票日期</span><input type="date" name="date" value="${esc(i.date)}" ${disabled}></label><label class="field"><span>价税合计（元）</span><input name="amount" value="${i.amount_cents?(i.amount_cents/100).toFixed(2):''}" inputmode="decimal" placeholder="0.00" ${disabled}></label><label class="field"><span>类别</span><select name="category" ${disabled}>${categories.map(c=>`<option ${c===i.category?'selected':''}>${c}</option>`).join('')}</select></label><label class="field wide"><span>所属项目</span><select name="project_id" ${disabled}>${projectOptions(i.project_id,'未分配项目')}</select></label><label class="field wide"><span>备注</span><textarea name="note" maxlength="1000" placeholder="用途、行程或其他说明" ${disabled}>${esc(i.note)}</textarea></label></div>`;
+  const original = i.file_url?`<section class="invoice-original"><div class="original-link"><span>${esc(i.file_name || '发票原件')}</span>${originalActions(i,'','放大预览')}</div>${originalViewerMarkup(i.file_url,i.file_name)}</section>`:'';
   const review = i.review_note && !i.verified?`<p class="hint warn" style="margin-bottom:20px">${esc(i.review_note)}</p>`:'';
   const lockedNote = locked?`<p class="hint" style="margin-bottom:20px">${i.owner_id && !owned?'这张发票由 '+esc(i.owner_name || '群组成员')+' 分享，票面信息由上传者维护。':'这张发票已被报销单占用，当前仅可查看。'}</p>`:'';
   const hasHistory = state.batches.some(b => (b.invoice_ids || []).includes(i.id) || (b.items || []).some(item => item.id===i.id || item.invoice_id===i.id));
-  openModal(i.id?(locked?'发票详情':'核对发票'):'手动录入发票',i.id?'查看原件，确认票面信息。':'未完成核对也可以先保存。',original+review+lockedNote+fields,`${i.id && owned?`<button type="button" class="btn" data-action="invoice-shares" data-id="${esc(i.id)}">群组分享</button>`:''}${i.id && !locked && !hasHistory?`<button type="button" class="btn danger left" data-action="delete-invoice" data-id="${esc(i.id)}">删除</button>`:''}<button type="button" class="btn" data-action="close-modal">${locked?'关闭':'取消'}</button>${!locked?'<button class="btn primary" type="submit">保存发票</button>':''}`,'invoice',`data-id="${esc(i.id)}"`);
+  openModal(i.id?(locked?'发票详情':'核对发票'):'手动录入发票',i.id?'查看原件，确认票面信息。':'填写票面信息后确认核对。',original+review+lockedNote+fields,`${i.id && owned?`<button type="button" class="btn" data-action="invoice-shares" data-id="${esc(i.id)}">群组分享</button>`:''}${i.id && !locked && !hasHistory?`<button type="button" class="btn danger left" data-action="delete-invoice" data-id="${esc(i.id)}">删除</button>`:''}<button type="button" class="btn" data-action="close-modal">${locked?'关闭':'取消'}</button>${!locked?'<button class="btn primary" type="submit">确认核对</button>':''}`,'invoice',`data-id="${esc(i.id)}"`);
+  const viewer = $('[data-original-viewer]',modal);
+  if (viewer) loadOriginalViewer(viewer);
 }
 function batchModal(invoiceIds,quotaId = '') {
   const invoices = state.invoices.filter(i=>invoiceIds.includes(i.id));
@@ -214,13 +221,87 @@ function batchModal(invoiceIds,quotaId = '') {
   const content = `<p class="import-summary">${invoices.length} 张发票 · 合计 ¥ ${fmt(total)}</p><div class="form-stack"><label class="field"><span>报销单名称</span><input name="name" value="${esc(localDate()+' 报销')}" maxlength="100" required></label><div class="form-grid"><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(sharedProject,'未分配项目')}</select></label><label class="field"><span>报销月份</span><input type="month" name="month" value="${esc(quota?.month || currentMonth())}" required></label></div><label class="field"><span>关联月度额度</span><select name="quota_id">${quotaOptions(quotaId)}</select></label><p class="hint">创建草稿后，发票将被占用。选择额度后，草稿金额计入该月已用额度；月份与类别需符合所选额度。</p><details><summary class="link-button">查看 ${invoices.length} 张发票</summary><div class="mini-list">${invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name)}<div class="minor">${esc(i.date)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div></details></div>`;
   openModal('创建报销草稿','确认这组发票的归属与报销月份。',content,'<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">创建草稿</button>','batch',`data-ids="${esc(JSON.stringify(invoiceIds))}"`);
 }
+function originalActions(invoice, batchId = '', previewLabel = '预览') {
+  if (!invoice.file_url) return '<span class="minor">无原件</span>';
+  const attributes = `data-url="${esc(invoice.file_url)}" data-original-id="${esc(invoice.id)}" data-batch="${esc(batchId)}" data-filename="${esc(invoice.original_file_name || invoice.file_name || '发票原件')}"`;
+  return `<div class="original-actions"><button type="button" class="btn small" data-action="preview-original" ${attributes}>${esc(previewLabel)}</button><button type="button" class="btn small" data-action="download" ${attributes} data-original-download="true">下载</button></div>`;
+}
+function originalViewerMarkup(url, name) {
+  return `<div class="original-viewer" data-original-viewer data-url="${esc(url)}" data-filename="${esc(name)}"><div class="preview-toolbar" hidden><button type="button" class="btn small" data-action="preview-page" data-step="-1">上一页</button><span class="number" data-preview-pages aria-live="polite"></span><button type="button" class="btn small" data-action="preview-page" data-step="1">下一页</button></div><div class="preview-content" aria-live="polite"></div></div>`;
+}
+function cleanupOriginalViewers(root) {
+  for (const [viewer, data] of originalViewers) {
+    if (!root.contains(viewer)) continue;
+    data.controller.abort();
+    if (data.objectURL) URL.revokeObjectURL(data.objectURL);
+    originalViewers.delete(viewer);
+  }
+}
+async function loadOriginalViewer(viewer, page = 1) {
+  cleanupOriginalViewers(viewer);
+  const data = {controller:new AbortController(),objectURL:null,page};
+  originalViewers.set(viewer,data);
+  const signal = data.controller.signal;
+  const name = viewer.dataset.filename || '原件';
+  const extension = name.split('.').pop().toLowerCase();
+  const content = $('.preview-content',viewer);
+  const toolbar = $('.preview-toolbar',viewer);
+  const buttons = $$('button',toolbar);
+  toolbar.hidden = extension!=='pdf';
+  buttons.forEach(button=>button.disabled=true);
+  content.innerHTML='<div class="loading-state"><span class="spinner"></span><p>正在加载原件…</p></div>';
+  if (!['pdf','png','jpg','jpeg','webp','xml'].includes(extension)) {
+    content.innerHTML='<p class="preview-message">此格式暂不支持页内预览，请下载原件查看。</p>';
+    return;
+  }
+  try {
+    const response = await fetch(viewer.dataset.url+(extension==='pdf'?'?preview_page='+page:''),{signal});
+    if (!response.ok) {const error=await response.json().catch(()=>({}));throw new Error(error.detail || '原件加载失败，请重试。');}
+    let element;
+    if (extension==='xml') {
+      element=document.createElement('pre');element.className='preview-xml';element.textContent=await response.text();
+    } else {
+      const blob=await response.blob();
+      if (signal.aborted) return;
+      data.objectURL=URL.createObjectURL(blob);
+      element=document.createElement('img');element.src=data.objectURL;
+      element.alt=extension==='pdf'?'PDF 原件 · 第 '+page+' 页':name;
+      element.addEventListener('error',()=>{content.textContent='图片无法显示，请下载原件查看。';});
+    }
+    if (signal.aborted) return;
+    content.replaceChildren(element);content.scrollTop=0;
+    if (extension==='pdf') {
+      const total=Number(response.headers.get('X-Preview-Pages')) || 1;
+      $('[data-preview-pages]',viewer).textContent=page+' / '+total;
+      buttons[0].disabled=page<=1;buttons[1].disabled=page>=total;
+    }
+  } catch(error) {
+    if (!signal.aborted) {content.textContent=error.message;toolbar.hidden=true;}
+  }
+}
+async function previewOriginal(button) {
+  cleanupOriginalViewers(preview);
+  const name=button.dataset.filename;
+  preview.innerHTML=`<div class="modal-head"><div><h2 id="preview-title">原件预览</h2><p>${esc(name)}</p></div><button type="button" class="icon-btn" data-action="close-preview" aria-label="关闭预览">×</button></div>${originalViewerMarkup(button.dataset.url,name)}<div class="modal-footer"><button type="button" class="btn" data-action="close-preview">返回</button><button type="button" class="btn primary" data-action="download" data-original-download="true" data-url="${esc(button.dataset.url)}" data-original-id="${esc(button.dataset.originalId)}" data-batch="${esc(button.dataset.batch || '')}" data-filename="${esc(name)}">下载原件</button></div>`;
+  if (!preview.open) preview.showModal();
+  await loadOriginalViewer($('[data-original-viewer]',preview));
+}
+preview.addEventListener('close',()=>{cleanupOriginalViewers(preview);preview.replaceChildren();});
+modal.addEventListener('close',()=>cleanupOriginalViewers(modal));
+preview.addEventListener('click',event=>{
+  if(event.target!==preview)return;
+  const rect=preview.getBoundingClientRect();
+  if(event.clientX<rect.left||event.clientX>rect.right||event.clientY<rect.top||event.clientY>rect.bottom)preview.close();
+});
 function batchDetail(id) {
   const b = state.batches.find(x=>x.id===id);
   if (!b) return;
   const quota = state.quotas.find(q=>q.id===b.quota_id);
   const items = b.items?.length?b.items:state.invoices.filter(i=>(b.invoice_ids || []).includes(i.id));
-  openModal(esc(b.name),`<span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span>`, `<div class="batch-total">¥ ${fmt(b.total_cents)}</div><dl class="detail-grid"><div><dt>所属项目</dt><dd>${esc(projectName(b.project_id))}</dd></div><div><dt>报销月份</dt><dd>${esc(b.month)}</dd></div><div><dt>月度额度</dt><dd>${quota?esc(quota.month+' · '+quota.category):'未关联额度'}</dd></div><div><dt>发票数量</dt><dd>${items.length} 张</dd></div></dl><div class="mini-list">${items.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name || '发票')}<div class="minor">${esc(i.date)} · ${esc(i.category)} · ${esc(i.number || '未填写号码')}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div>`,`${b.can_manage!==false && b.status==='draft'?`<button class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="cancelled">撤销草稿</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="rejected">标记退回</button>`:''}<button class="btn" data-action="download" data-url="/api/batches/${encodeURIComponent(b.id)}/export" data-filename="报销单.zip">导出报销包</button><button class="btn primary" data-action="close-modal">完成</button>`);
+  const files = items.filter(i=>i.file_url);
+  openModal(esc(b.name),`<span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span>`, `<div class="batch-total">¥ ${fmt(b.total_cents)}</div><dl class="detail-grid"><div><dt>所属项目</dt><dd>${esc(projectName(b.project_id))}</dd></div><div><dt>报销月份</dt><dd>${esc(b.month)}</dd></div><div><dt>月度额度</dt><dd>${quota?esc(quota.month+' · '+quota.category):'未关联额度'}</dd></div><div><dt>发票数量</dt><dd>${items.length} 张</dd></div></dl>${files.length?`<section class="batch-download-options"><div class="batch-download-heading"><label class="check-label"><input type="checkbox" data-rename-originals><span>下载时重命名原件</span></label><button type="button" class="btn small" data-action="download" data-batch-export="true" data-originals-only="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">批量下载原件（${files.length}）</button></div><p class="hint">勾选后按「序号-类别-金额」命名，可逐张修改。未勾选时保留原文件名；重名文件自动加后缀。</p></section>`:''}<div class="mini-list batch-invoices">${items.map((i,index)=>`<div class="mini-item batch-invoice"><div class="batch-invoice-info">${esc(i.seller || i.file_name || '发票')}<div class="minor">${esc(i.date)} · ${esc(i.category)} · ${esc(i.number || '未填写号码')}</div>${i.file_url?`<label class="rename-field" data-rename-field hidden><span>下载文件名</span><div><input data-export-name="${esc(i.id)}" aria-label="第 ${index+1} 张原件的下载文件名" value="${esc(String(index+1).padStart(3,'0')+'-'+i.category+'-'+(i.amount_cents/100).toFixed(2))}" required maxlength="100" disabled><span>.${esc((i.original_file_name || i.file_name).split('.').pop())}</span></div></label>`:''}</div><div class="batch-invoice-actions"><span class="money">¥ ${fmt(i.amount_cents)}</span>${originalActions(i,b.id)}</div></div>`).join('')}</div>`,`${b.can_manage!==false && b.status==='draft'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="cancelled">撤销草稿</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="rejected">标记退回</button>`:''}<button type="button" class="btn" data-action="download" data-batch-export="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">导出报销包</button><button type="button" class="btn primary" data-action="close-modal">完成</button>`);
 }
+
 async function importFiles(files) {
   if (!files.length || modalBusy) return;
   openModal('正在导入发票',`共 ${files.length} 个文件，请稍候。`,'<div class="loading-state" style="padding:30px"><span class="spinner"></span><p>读取票面信息并检查重复文件…</p></div>');
@@ -240,11 +321,27 @@ async function importFiles(files) {
   } finally {modalBusy = false;$('#file-input').value='';}
 }
 async function download(button) {
+  if (button.disabled) return;
+  let path = button.dataset.url;
+  let options = {};
+  const rename = $('[data-rename-originals]',modal)?.checked || false;
+  if (button.dataset.batchExport) {
+    const inputs = $$('[data-export-name]',modal);
+    if (rename && inputs.some(input=>!input.reportValidity())) return;
+    options = {method:'POST',headers:{'X-Requested-With':'InvoiceDesk','Content-Type':'application/json'},body:JSON.stringify({rename,originals_only:button.dataset.originalsOnly==='true',filenames:rename?Object.fromEntries(inputs.map(input=>[input.dataset.exportName,input.value])):{}})};
+  } else if (button.dataset.originalDownload) {
+    const params = new URLSearchParams({download:'true'});
+    if (button.dataset.batch && rename) {
+      const input = $$('[data-export-name]',modal).find(input=>input.dataset.exportName===button.dataset.originalId);
+      if (input) {if(!input.reportValidity())return;params.set('filename',input.value);}
+    }
+    path += '?' + params;
+  }
   const original = button.textContent;
   button.disabled = true;
   button.textContent = '正在准备…';
   try {
-    const response = await fetch(scopedURL(button.dataset.url));
+    const response = await fetch(scopedURL(path),options);
     if (!response.ok) {
       const error = await response.json().catch(()=>({}));
       throw new Error(typeof error.detail==='string'?error.detail:'导出失败，请重试。');
@@ -276,6 +373,9 @@ document.addEventListener('click',async event=>{
   if (!button) return;
   const action=button.dataset.action,id=button.dataset.id;
   if(action==='import'){$('#file-input').click();return;}
+  if(action==='close-preview'){preview.close();return;}
+  if(action==='preview-page'){const viewer=button.closest('[data-original-viewer]');const data=originalViewers.get(viewer);if(!button.disabled&&data)await loadOriginalViewer(viewer,data.page+Number(button.dataset.step));return;}
+  if(action==='preview-original'){await previewOriginal(button);return;}
   if(action==='close-modal'){closeModal();return;}
   if(action==='new-invoice'){invoiceModal();return;}
   if(action==='edit-invoice'){invoiceModal(id);return;}
@@ -316,6 +416,7 @@ document.addEventListener('input',event=>{
 });
 document.addEventListener('change',event=>{
   const el=event.target;
+  if(el.matches('[data-rename-originals]')){$$('[data-rename-field]',modal).forEach(field=>{field.hidden=!el.checked;$('input',field).disabled=!el.checked;});}
   if(el.dataset.filter){filters[el.dataset.filter]=el.value;updateInvoiceTable();}
   if(el.dataset.select){if(el.checked)selected.add(el.dataset.select);else selected.delete(el.dataset.select);updateSelection();const all=$('#select-all');if(all){const eligible=visibleInvoices().filter(i=>i.verified&&i.status==='available');all.checked=eligible.length>0&&eligible.every(i=>selected.has(i.id));all.indeterminate=eligible.some(i=>selected.has(i.id))&&!all.checked;}}
   if(el.id==='select-all'){visibleInvoices().filter(i=>i.verified&&i.status==='available').forEach(i=>el.checked?selected.add(i.id):selected.delete(i.id));updateInvoiceTable();}
@@ -338,17 +439,17 @@ document.addEventListener('submit',async event=>{
   try {
     if(form.dataset.form==='invoice'){
       const id=form.dataset.id;
-      const payload={number:data.number.trim(),seller:data.seller.trim(),buyer:data.buyer.trim(),date:data.date,category:data.category,project_id:data.project_id || null,note:data.note.trim(),amount_cents:data.amount?cents(data.amount):0,verified:data.verified==='on'};
-      if(payload.verified&&(!payload.seller||!payload.date||payload.amount_cents<=0))throw new Error('确认核对前，请补全销售方、开票日期和大于零的金额。');
+      const payload={number:data.number.trim(),seller:data.seller.trim(),buyer:data.buyer.trim(),date:data.date,category:data.category,project_id:data.project_id || null,note:data.note.trim(),amount_cents:data.amount?cents(data.amount):0,verified:true};
+      if(!payload.seller||!payload.date||payload.amount_cents<=0)throw new Error('确认核对前，请补全销售方、开票日期和大于零的金额。');
       await api(id?`/api/invoices/${encodeURIComponent(id)}`:'/api/invoices',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
-      modal.close();await refresh();matchData=null;toast('发票已保存。');
+      modal.close();await refresh();matchData=null;toast('发票已确认核对。');
     }else if(form.dataset.form==='match'){
       matchData=null;
       matchValues={...data};
       const target=cents(data.target);
       if(target<=0||target>10000000)throw new Error('目标金额需大于 0 且不超过 100,000 元。');
       if(data.date_from&&data.date_to&&data.date_from>data.date_to)throw new Error('开始日期不能晚于结束日期。');
-      const payload={target_cents:target};
+      const payload={target_cents:target,direction:data.direction};
       ['category','project_id','date_from','date_to','buyer','quota_id'].forEach(key=>{if(data[key])payload[key]=data[key];});
       $('#match-results').innerHTML='<div class="panel loading-state"><span class="spinner"></span><p>正在寻找合适的发票组合…</p></div>';
       const requestedScope=activeGroupId;
@@ -362,7 +463,7 @@ document.addEventListener('submit',async event=>{
     }else if(form.dataset.form==='quota'){
       await api('/api/quotas',{method:'POST',body:JSON.stringify({month:data.month,category:data.category,amount_cents:cents(data.amount)})});modal.close();await refresh();toast('额度已保存。');
     }
-  }catch(error){errorBox.textContent=error.message;if(form.dataset.form==='match' && $('#match-results'))$('#match-results').innerHTML=renderMatchResults();}
+  }catch(error){errorBox.textContent=error.message;if(form.dataset.form==='invoice')errorBox.scrollIntoView({block:'nearest'});if(form.dataset.form==='match' && $('#match-results'))$('#match-results').innerHTML=renderMatchResults();}
   finally{button.disabled=false;button.textContent=originalText;modalBusy=false;}
 });
 modal.addEventListener('cancel',event=>{if(modalBusy)event.preventDefault();});
@@ -389,6 +490,7 @@ function updateWorkspaceChrome() {
   $('#account-avatar').textContent=(currentUser?.name || '票').slice(0,1);
 }
 function renderAuth() {
+  document.body.classList.remove('match-page');
   document.body.classList.add('auth-mode');
   document.title='登录 · 票栈';
   const registering=authMode==='register' && registrationOpen;
@@ -423,7 +525,7 @@ async function switchGroup(groupId) {
     localStorage.setItem('invoice.activeGroup',activeGroupId);
     selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
     filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
-    matchValues={target:'',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
+    matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
     renderPage();toast(`已切换到${currentGroup()?.name || '个人空间'}。`);
   } catch(error) {activeGroupId=old;$('#space-select').value=old;toast(error.message);if(activePage==='mailboxes')loadReceiptAddresses();} finally {$('#space-select').disabled=false;scopeBusy=false;}
 }
@@ -560,7 +662,7 @@ document.addEventListener('click',async event=>{
       if(activeGroupId===id){
         activeGroupId='';localStorage.removeItem('invoice.activeGroup');selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
         filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
-        matchValues={target:'',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
+        matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
       }
       modal.close();await refresh();toast('已退出群组，个人发票保留。');
     });return;

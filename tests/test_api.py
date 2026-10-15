@@ -118,6 +118,32 @@ class InvoiceApiTests(unittest.TestCase):
                          'invoice_ids': combination['invoice_ids'], 'quota_id': quota['id']})
         self.assertEqual(batch['total_cents'], 1100)
 
+    def test_match_below_prefers_exact_and_respects_remaining_quota(self):
+        self.invoice(700)
+        self.invoice(299)
+        exact = self.invoice(1000)
+        quota_invoice = self.invoice(600)
+        matching = self.match(direction='below')
+        self.assertEqual(matching['direction'], 'below')
+        self.assertEqual(matching['combinations'][0]['invoice_ids'], [exact['id']])
+        self.assertEqual(matching['combinations'][0]['gap_cents'], 0)
+        self.assertTrue(all(row['total_cents'] <= 1000 for row in matching['combinations']))
+        self.assertEqual(self.match()['direction'], 'above')
+        self.batch([exact])
+        self.assertEqual(self.match(direction='below')['combinations'][0]['total_cents'], 999)
+        quota = self.call('POST', '/api/quotas', {'month': '2026-10', 'category': '餐饮', 'amount_cents': 600})
+        matching = self.match(direction='below', quota_id=quota['id'])
+        self.assertEqual(matching['target_cents'], 1000)
+        self.assertEqual(matching['combinations'][0]['total_cents'], 600)
+        self.assertEqual(matching['combinations'][0]['gap_cents'], 400)
+        self.assertTrue(all(row['total_cents'] <= 600 for row in matching['combinations']))
+        self.batch([quota_invoice], quota_id=quota['id'])
+        exhausted = self.match(direction='below', quota_id=quota['id'])
+        self.assertEqual(exhausted['combinations'], [])
+        self.assertIn('剩余额度', exhausted['message'])
+        self.assertEqual(self.match(1, direction='below')['combinations'], [])
+        self.call('POST', '/api/match', {'target_cents': 1000, 'direction': 'invalid'}, status=400)
+
     def test_cancel_and_reject_release_invoices_but_keep_history_paid_is_final(self):
         invoice = self.invoice(seller='最初商家')
         first = self.batch([invoice])
@@ -174,7 +200,7 @@ class InvoiceApiTests(unittest.TestCase):
         response = self.client.get('/api/batches/' + batch['id'] + '/export')
         self.assertEqual(response.status_code, 200)
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
-            self.assertEqual(archive.read('原件/001_原始发票.xml'), original)
+            self.assertEqual(archive.read('原件/原始发票.xml'), original)
             snapshot = json.loads(archive.read('报销单.json'))
             self.assertEqual(snapshot['items'][0]['amount_cents'], 1234)
             sheet = load_workbook(io.BytesIO(archive.read('发票明细.xlsx')), data_only=False).active
@@ -187,6 +213,84 @@ class InvoiceApiTests(unittest.TestCase):
         library = load_workbook(io.BytesIO(self.client.get('/api/export').content)).active
         self.assertEqual(library['B2'].value, '当前商家')
         self.assertEqual(library['F2'].value, 43.21)
+
+    def test_original_download_and_editable_batch_filenames_use_snapshot(self):
+        from urllib.parse import unquote
+        invoice, original = self.xml_import()
+        self.call('PATCH', '/api/invoices/' + invoice['id'], {'verified': True, 'category': '餐饮'})
+        batch = self.batch([invoice])
+        file_url = batch['items'][0]['file_url']
+        response = self.client.get(invoice['file_url'], params={'download': 'true'})
+        self.assertEqual(response.content, original)
+        self.assertIn('attachment;', response.headers['content-disposition'])
+        self.assertIn('原始发票.xml', unquote(response.headers['content-disposition']))
+        self.assertTrue(self.client.get(file_url).headers['content-type'].startswith('application/xml'))
+        self.call('PATCH', '/api/batches/' + batch['id'], {'status': 'cancelled'})
+        self.call('PATCH', '/api/invoices/' + invoice['id'], {'category': '交通', 'amount_cents': 9999})
+        export_url = '/api/batches/' + batch['id'] + '/export'
+        response = self.client.post(export_url, json={'originals_only': True, 'rename': True})
+        self.assertEqual(response.status_code, 200, response.text)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ['原件/001-餐饮-12.34.xml'])
+            self.assertEqual(archive.read(archive.namelist()[0]), original)
+        options = {'originals_only': True, 'rename': True, 'filenames': {invoice['id']: '001-午餐-12.34'}}
+        response = self.client.post(export_url, json=options)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ['原件/001-午餐-12.34.xml'])
+        response = self.client.get(file_url, params={'download': True, 'filename': '001-午餐-12.34'})
+        self.assertEqual(response.content, original)
+        self.assertIn('001-午餐-12.34.xml', unquote(response.headers['content-disposition']))
+        options['rename'] = False
+        response = self.client.post(export_url, json=options)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(archive.namelist(), ['原件/原始发票.xml'])
+        self.assertEqual(self.state()['invoices'][0]['file_name'], '原始发票.xml')
+
+    def test_batch_download_handles_duplicate_names_missing_files_and_invalid_names(self):
+        first, original = self.xml_import('FIRST')
+        second, other = self.xml_import('SECOND')
+        for invoice in (first, second):
+            self.call('PATCH', '/api/invoices/' + invoice['id'], {'verified': True})
+        manual = self.invoice()
+        batch = self.batch([first, second, manual])
+        url = '/api/batches/' + batch['id'] + '/export'
+        response = self.client.post(url, json={'originals_only': True})
+        self.assertEqual(response.status_code, 200, response.text)
+        with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+            self.assertEqual(set(archive.namelist()), {'原件/原始发票.xml', '原件/原始发票-2.xml', '无原件记录.txt'})
+            self.assertEqual(archive.read('原件/原始发票.xml'), original)
+            self.assertEqual(archive.read('原件/原始发票-2.xml'), other)
+            self.assertIn('003_', archive.read('无原件记录.txt').decode())
+        for bad in ('../escape', 'bad\\name', '', 'x' * 181):
+            response = self.client.post(url, json={'rename': True, 'filenames': {first['id']: bad}})
+            self.assertEqual(response.status_code, 400, response.text)
+        self.assertEqual(self.client.post(url, json={'rename': True, 'filenames': {'outside': '文件'}}).status_code, 400)
+        self.assertEqual(self.client.get(batch['items'][0]['file_url'], params={'download': True, 'filename': '../escape'}).status_code, 400)
+        self.assertEqual(self.client.get(batch['items'][2]['file_url'] or '/api/batches/' + batch['id'] + '/invoices/' + manual['id'] + '/file').status_code, 404)
+
+    def test_pdf_preview_renders_one_page_at_a_time_and_validates_page_range(self):
+        import pymupdf
+        invoice = self.invoice()
+        relative = 'originals/' + invoice['id'] + '.pdf'
+        with pymupdf.open() as document:
+            for text in ('SAMPLE PAGE ONE', 'SAMPLE PAGE TWO'):
+                document.new_page().insert_text((40, 40), text)
+            document.save(self.data / relative)
+        with db.connection(write=True) as conn:
+            conn.execute('UPDATE invoices SET file_path=?,file_name=? WHERE id=?', (relative, 'sample.pdf', invoice['id']))
+        batch = self.batch([invoice])
+        for url in ('/api/invoices/' + invoice['id'] + '/file', batch['items'][0]['file_url']):
+            for page in (1, 2):
+                response = self.client.get(url, params={'preview_page': page})
+                self.assertEqual(response.status_code, 200, response.text if response.status_code != 200 else '')
+                self.assertEqual(response.headers['content-type'], 'image/png')
+                self.assertEqual(response.headers['x-preview-pages'], '2')
+                image = pymupdf.Pixmap(response.content)
+                self.assertLessEqual(max(image.width, image.height), 2000)
+            for page in (0, -1, 3):
+                self.assertEqual(self.client.get(url, params={'preview_page': page}).status_code, 400)
+        xml, _ = self.xml_import()
+        self.assertEqual(self.client.get(xml['file_url'], params={'preview_page': 1}).status_code, 400)
 
     def test_personal_backup_contains_own_records_and_originals_only(self):
         invoice, original = self.xml_import()

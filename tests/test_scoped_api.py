@@ -65,10 +65,21 @@ class ScopedApiTests(unittest.TestCase):
         self.assertEqual(self.a.put('/api/invoices/'+invoice['id']+'/shares',json={'group_ids':[other_gid]}).status_code,409)
         self.assertEqual(self.c.get('/api/state',params={'group_id':gid}).status_code,403)
         self.assertEqual(self.c.get('/api/batches/'+batch['id']+'/export').status_code,403)
+        batch_file = batch['items'][0]['file_url']
+        self.assertEqual(self.c.get(batch_file, params={'download': True}).status_code,403)
+        self.assertEqual(self.c.get(batch_file, params={'preview_page': 1}).status_code,403)
+        self.assertEqual(self.c.post('/api/batches/'+batch['id']+'/export', json={'originals_only': True}).status_code,403)
+        other = self.ok(self.a.post('/api/invoices', json={'seller':'Other','date':'2026-10-15','amount_cents':100,'verified':True}))
+        self.assertEqual(self.b.get('/api/batches/'+batch['id']+'/invoices/'+other['id']+'/file').status_code,404)
         self.ok(self.b.patch('/api/batches/'+batch['id'],json={'status':'cancelled'}))
         self.ok(self.a.put('/api/invoices/'+invoice['id']+'/shares',json={'group_ids':[other_gid]}))
         self.assertEqual(self.ok(self.b.get('/api/state',params={'group_id':gid}))['invoices'],[])
         self.assertEqual(self.b.get(invoice['file_url']).status_code,403)
+        self.assertEqual(self.b.get(batch_file).status_code,200)
+        exported = self.b.post('/api/batches/'+batch['id']+'/export', json={'originals_only': True, 'rename': True})
+        self.assertEqual(exported.status_code,200)
+        with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+            self.assertEqual(archive.namelist(), ['原件/001-其他-12.34.xml'])
         self.assertEqual(self.ok(self.a.post('/api/match',json={'target_cents':1234,'group_id':other_gid}))['combinations'][0]['total_cents'],1234)
 
     def test_personal_export_and_scoped_quotas_do_not_leak(self):
