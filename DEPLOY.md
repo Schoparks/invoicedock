@@ -208,9 +208,10 @@ GitHub `main` 为后续源码更新入口。不要再上传散文件覆盖服务
 
    ```sh
    cd /srv/invoice-desk
-   git pull --ff-only origin main
-   /opt/miniconda3/envs/invoice-desk/bin/python -m pip install -r requirements.lock.txt
+   INVOICEDOCK_PYTHON=/opt/miniconda3/envs/invoice-desk/bin/python ./update.sh
    ```
+
+   更新脚本要求 main 分支及干净工作区，内部执行 `git pull --ff-only origin main`；锁文件变化或依赖缺失/版本不符时才安装依赖。Shell 与 Windows 入口共用 `update.py`，不自动停止或启动服务，不覆盖运行配置和数据。
 
 4. 通过现有托管器启动，检查提交号、单进程状态、`/api/auth/status`、登录与原件访问。数据库迁移在启动时执行。
 5. 失败时保留日志，使用匹配的源码版本与完整备份恢复，不删除数据表或重新生成邮箱密钥。

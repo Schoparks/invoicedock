@@ -103,13 +103,17 @@ python -m pip install -r requirements.lock.txt
 
 通用 Linux、Conda、systemd 和 Nginx 配置见 [部署说明](DEPLOY.md)。已有托管环境沿用其服务管理方式。
 
-后续源码更新统一通过 Git 拉取：
+更新脚本沿用“一次命令拉取代码、按需安装依赖”的方式：
 
 ```sh
-git pull --ff-only origin main
+./update.sh
 ```
 
-执行前先检查工作区并备份数据及配置，随后按需安装锁定依赖，通过托管器重启并验证。拉取源码不会自动发布 Cloudflare Worker。真实服务器、账号、路由及 Hermes 交接详情仅保留在私有运维记录中。
+Windows 可运行 `./update.ps1` 或双击 `update.cmd`。脚本使用 Conda 的 `invoice-desk` 环境；若 Conda 不在 PATH，可用 `INVOICEDOCK_PYTHON` 指定该环境内 Python 的绝对路径。也可激活环境后执行 `python update.py`。
+
+脚本要求 `main` 分支和干净工作区，通过 `git pull --ff-only origin main` 更新；仅在锁文件变化、已安装依赖缺失或版本不符时安装依赖。遇到本地改动或分叉会停止，不覆盖配置、数据或强制重置 Git。
+
+服务器由维护者先通过托管器停服并备份，执行脚本后再启动并验证；脚本本身不操作托管器，也不会发布 Cloudflare Worker。现有服务器部署操作由 Hermes 负责，真实服务器、账号、路由及交接详情仅保留在私有运维记录中。
 
 ## 开发
 
@@ -128,6 +132,7 @@ tests/        自动化检查
 deploy/       通用部署模板与邮件上游
 run.py        单进程服务入口
 manage.py     创建账号与重置密码
+update.py     Git 拉取及按需更新依赖（含 Shell/Windows 入口）
 ```
 
 参与维护前请阅读 [AGENTS.md](AGENTS.md)，按变更更新文档与必要检查。报告问题请说明复现步骤和运行环境，不要上传真实发票、邮件原文、数据库或凭据。

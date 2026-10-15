@@ -12,6 +12,7 @@
 ## 当前项目
 
 - 名称：**票栈 · InvoiceDock**。个人与群组发票管理，支持本地运行及自行部署。
+- 更新入口：`./update.sh`、`./update.ps1`、`update.cmd` 或当前项目环境中的 `python update.py`；共用 `update.py` 完成 main 的 ff-only 拉取和按需锁定依赖安装。脚本不管理服务、数据备份或 Worker 发布；私有配置通过忽略文件保留，禁止硬编码真实服务器。`INVOICEDOCK_PYTHON` 可指定项目解释器。
 - 后端：Python 3.12、FastAPI、SQLite；前端：`static/` 中的原生 HTML/CSS/JavaScript，无构建步骤。
 - 环境管理沿用 Conda：`environment.yml`，环境名 `invoice-desk`。运行依赖由 `requirements.lock.txt` 锁定，直接依赖声明在 `requirements.in`。`conda-osx-arm64.lock.txt` 仅用于 Apple Silicon 的 Conda 基础包复现，不适用于 Linux。
 - 品牌名称已更新；兼容现有部署的 `INVOICE_*` 环境变量、Conda 环境名、`InvoiceDesk` 请求头与备份格式标记保持不变。不要因名称调整破坏已有客户端、数据或服务配置。
@@ -54,6 +55,7 @@ node --test tests/test_email_worker.mjs
 ## 服务器更新与 Hermes 交接
 
 - GitHub `main` 是后续源码更新入口。服务器从仓库 clone，并使用 `git pull --ff-only origin main` 更新；不再通过散文件覆盖或压缩包同步源码。
+- **服务器部署操作交由用户的专属运维 agent Hermes 执行**，使用其已获授权的托管账号。当前 agent 负责仓库代码、文档、脚本与交接，不自行修改或重启生产服务。
 - 首次切换及具体路径、托管器、代理和健康检查由 Hermes 对接，在私有运维记录中保留**当前最终态**。先读取实际配置，不假定通用 systemd 模板就是现有线上管理方式。
 - `.env`/`app.env`、数据目录和密钥不进入 Git，不被更新覆盖。更新前备份完整数据与配置，记录旧提交；按需要安装锁定依赖，通过现有托管器重启单进程服务并验证。
 - Cloudflare Worker 的源码拉取与发布是两个步骤。拉取不会自动发布 Worker；部署时保留服务端对应密钥、真实入口、路由及必要兼容开关，不直接用示例配置覆盖生产设置。
