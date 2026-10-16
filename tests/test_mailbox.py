@@ -84,7 +84,7 @@ class MailboxTests(unittest.TestCase):
         with db.connection(write=True) as connection:
             for number in range(1, 5):
                 connection.execute('INSERT INTO users VALUES (?,?,?,?,?)', (f'u{number}', f'user{number}@example.com', f'User {number}', 'unused', '2026-10-15'))
-            connection.execute('INSERT INTO groups VALUES (?,?,?,?)', ('g1', 'Team', 'u1', '2026-10-15'))
+            connection.execute('INSERT INTO groups(id,name,created_by,created_at) VALUES (?,?,?,?)', ('g1', 'Team', 'u1', '2026-10-15'))
             for user_id, role in (('u1', 'owner'), ('u2', 'admin'), ('u3', 'member')):
                 connection.execute('INSERT INTO group_members VALUES (?,?,?,?)', ('g1', user_id, role, '2026-10-15'))
         self.inbox = FakeInbox()
@@ -171,6 +171,23 @@ class MailboxTests(unittest.TestCase):
         self.assertEqual(self.sync(inbox, retry=True)['imported'], 0)
         results = self.client.get('/api/mailboxes/' + inbox['id'] + '/results').json()['results']
         self.assertEqual({row['status'] for row in results}, {'imported'})
+
+    def test_concurrent_departure_cannot_restore_old_mailbox_group(self):
+        inbox = self.bind(group_id='g1')
+        original_values = mailbox._values
+        def detach_during_validation(values, old, user_id):
+            result = original_values(values, old, user_id)
+            with db.connection(write=True) as connection:
+                connection.execute('UPDATE mailboxes SET group_id=NULL,enabled=0 WHERE id=?', (inbox['id'],))
+                connection.execute("DELETE FROM group_members WHERE group_id='g1' AND user_id='u1'")
+            return result
+        with patch.object(mailbox, '_values', side_effect=detach_during_validation):
+            response = self.client.patch('/api/mailboxes/'+inbox['id'], json={'name':'旧表单保存'})
+        self.assertEqual(response.status_code, 409, response.text)
+        with db.connection() as connection:
+            row = connection.execute('SELECT group_id,enabled FROM mailboxes WHERE id=?', (inbox['id'],)).fetchone()
+            self.assertIsNone(row['group_id'])
+            self.assertEqual(row['enabled'], 0)
 
     def test_group_mailboxes_require_admin_and_preserve_original_owner(self):
         inbox = self.bind(group_id='g1')

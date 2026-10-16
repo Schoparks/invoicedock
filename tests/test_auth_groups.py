@@ -255,7 +255,7 @@ class AuthGroupTests(unittest.TestCase):
             self.assertFalse(invoice_access(connection, invoice, outsider['id'], group['id']))
         self.assertEqual(self.owner_client.get(f'/api/invoices/{first}/shares').json()['group_ids'], [group['id']])
 
-    def test_leaving_and_unsharing_block_active_claims_and_preserve_paid_history(self):
+    def test_unsharing_blocks_active_claims_and_leaving_preserves_paid_history(self):
         group = self.group()
         member_client, member = self.account()
         self.add_member(group, member_client)
@@ -267,8 +267,6 @@ class AuthGroupTests(unittest.TestCase):
             connection.execute('INSERT INTO batch_items VALUES (?,?,?)', ('batch', invoice, json.dumps({'id': invoice, 'seller': '原始商家'})))
             connection.execute("UPDATE invoices SET status='draft',batch_id='batch' WHERE id=?", (invoice,))
         member_path = f'/api/groups/{group["id"]}/members/{member["id"]}'
-        self.assertEqual(member_client.delete(member_path).status_code, 409)
-        self.assertEqual(self.owner_client.delete(member_path).status_code, 409)
         self.assertEqual(member_client.put(f'/api/invoices/{invoice}/shares', json={'group_ids': []}).status_code, 409)
         with db.connection(write=True) as connection:
             connection.execute("UPDATE batches SET status='paid'")
@@ -281,7 +279,7 @@ class AuthGroupTests(unittest.TestCase):
             self.assertEqual(connection.execute('SELECT status FROM invoices').fetchone()[0], 'paid')
         self.assertEqual(member_client.get(f'/api/groups/{group["id"]}/members').status_code, 403)
 
-    def test_member_with_group_mailbox_must_remove_mailbox_before_leaving(self):
+    def test_leaving_returns_group_mailbox_to_original_account_and_pauses_it(self):
         group = self.group()
         member_client, member = self.account()
         self.add_member(group, member_client)
@@ -289,10 +287,39 @@ class AuthGroupTests(unittest.TestCase):
             connection.execute('CREATE TABLE mailboxes(id TEXT,owner_id TEXT,group_id TEXT,enabled INTEGER)')
             connection.execute('INSERT INTO mailboxes VALUES (?,?,?,0)', ('mailbox', member['id'], group['id']))
         path = f'/api/groups/{group["id"]}/members/{member["id"]}'
-        self.assertEqual(member_client.delete(path).status_code, 409)
-        with db.connection(write=True) as connection:
-            connection.execute('DELETE FROM mailboxes')
         self.assertEqual(member_client.delete(path).status_code, 200)
+        with db.connection() as connection:
+            row = dict(connection.execute('SELECT * FROM mailboxes').fetchone())
+            self.assertEqual(row['owner_id'], member['id'])
+            self.assertIsNone(row['group_id'])
+            self.assertEqual(row['enabled'], 0)
+
+    def test_team_settings_and_transfer_enforce_current_roles(self):
+        group = self.group()
+        member_client, member = self.account()
+        outsider_client, outsider = self.account()
+        self.add_member(group, member_client)
+        path = '/api/groups/' + group['id']
+        self.assertEqual(member_client.patch(path, json={'name': '不能修改'}).status_code, 403)
+        self.assertEqual(outsider_client.patch(path, json={'name': '不能修改'}).status_code, 403)
+        self.assertEqual(member_client.delete(path).status_code, 403)
+        self.assertEqual(self.owner_client.patch(path, json={'name': ' ', 'description': '说明'}).status_code, 400)
+        self.assertEqual(self.owner_client.patch(path, json={'description': '字' * 1001}).status_code, 400)
+        renamed = self.owner_client.patch(path, json={'name': ' 新团队 ', 'description': ' 协作说明 '})
+        self.assertEqual(renamed.status_code, 200, renamed.text)
+        self.assertEqual((renamed.json()['name'], renamed.json()['description']), ('新团队', '协作说明'))
+        self.assertEqual(self.owner_client.delete(path+'/members/'+self.owner['id']).status_code, 409)
+        self.assertEqual(member_client.post(path+'/transfer', json={'member_id': self.owner['id']}).status_code, 403)
+        self.assertEqual(self.owner_client.post(path+'/transfer', json={'member_id': outsider['id']}).status_code, 403)
+        self.assertEqual(self.owner_client.post(path+'/transfer', json={'member_id': self.owner['id']}).status_code, 400)
+        response = self.owner_client.post(path+'/transfer', json={'member_id': member['id']})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()['role'], 'admin')
+        self.assertEqual(member_client.get('/api/groups').json()[0]['role'], 'owner')
+        self.assertEqual(self.owner_client.delete(path).status_code, 403)
+        self.assertEqual(self.owner_client.delete(path+'/members/'+self.owner['id']).status_code, 200)
+        self.assertEqual(member_client.delete(path).status_code, 200)
+        self.assertEqual(member_client.get('/api/groups').json(), [])
 
     def test_owner_scopes_allow_independent_personal_quotas_and_project_names(self):
         _, member = self.account()

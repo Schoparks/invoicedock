@@ -298,8 +298,7 @@ def _process_delivery(delivery: dict) -> None:
     try:
         with connection() as db:
             address = dict(db.execute('SELECT * FROM receipt_addresses WHERE id=?', (delivery['address_id'],)).fetchone())
-            if address['group_id']:
-                require_group(db, address['owner_id'], address['group_id'])
+        # The importer resolves a concurrent departure into the original owner's personal library.
         content = _raw_path(delivery_id).read_bytes()
         for attachment in iter_message_attachments(content):
             index = attachment['index']

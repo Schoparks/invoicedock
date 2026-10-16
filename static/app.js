@@ -425,7 +425,7 @@ document.addEventListener('change',event=>{
 document.addEventListener('submit',async event=>{
   const form=event.target.closest('form[data-form]');
   if(!form)return;
-  if (['login','register','profile','password','group','join-group','shares','mailbox','receipt-address'].includes(form.dataset.form)) {event.preventDefault();await submitOnlineForm(form);return;}
+  if (['login','register','profile','password','group','group-settings','transfer-group','dissolve-group','join-group','shares','mailbox','receipt-address'].includes(form.dataset.form)) {event.preventDefault();await submitOnlineForm(form);return;}
   event.preventDefault();
   const button=$('button[type=submit]',form);
   if(button.disabled || (modal.contains(form)&&modalBusy))return;
@@ -531,7 +531,34 @@ async function switchGroup(groupId) {
 }
 function renderGroups() {
   const groups=state.groups || [];
-  return heading('SHARE WITH YOUR TEAM','群组管理','发票默认仅自己可见，按需分享给一个或多个群组。','<button class="btn" data-action="join-group">加入群组</button><button class="btn primary" data-action="new-group">＋ 创建群组</button>')+`<div class="hint group-hint">分享后，群组成员可以查看原件并使用发票报销。票面信息由上传者维护，同一张发票在所有群组共用报销状态，避免重复使用。</div>${groups.length?`<div class="batch-grid">${groups.map(g=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(g.name)}</h3><p>${g.member_count || 1} 位成员</p></div><span class="badge ${g.role==='owner'?'available':''}">${esc(roleName(g.role))}</span></div><p class="batch-detail">${g.id===activeGroupId?'当前所在的工作空间':'选择分享至本组的发票，组内协同报销。'}</p><div class="batch-actions"><button class="btn primary small" data-action="open-group" data-id="${esc(g.id)}">进入票库</button><button class="btn small" data-action="group-members" data-id="${esc(g.id)}">查看成员</button>${['owner','admin'].includes(g.role)?`<button class="btn small" data-action="invite-group" data-id="${esc(g.id)}">邀请成员</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('和团队一起整理发票','创建群组，或输入邀请码加入已有群组。你的个人发票不会自动对群组可见。','<button class="btn primary" data-action="new-group">创建第一个群组</button><button class="btn ghost" data-action="join-group">使用邀请码</button>','♧')}</div>`}`;
+  return heading('SHARE WITH YOUR TEAM','群组管理','发票默认仅自己可见，按需分享给一个或多个群组。','<button class="btn" data-action="join-group">加入群组</button><button class="btn primary" data-action="new-group">＋ 创建群组</button>')+`<div class="hint group-hint">分享后，群组成员可以查看原件并使用发票报销。票面信息由上传者维护，同一张发票在所有群组共用报销状态，避免重复使用。</div>${groups.length?`<div class="batch-grid">${groups.map(g=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(g.name)}</h3><p>${g.member_count || 1} 位成员</p></div><span class="badge ${g.role==='owner'?'available':''}">${esc(roleName(g.role))}</span></div><p class="batch-detail group-description">${esc(g.description || (g.id===activeGroupId?'当前所在的工作空间':'选择分享至本组的发票，组内协同报销。'))}</p><div class="batch-actions"><button class="btn primary small" data-action="open-group" data-id="${esc(g.id)}">进入票库</button><button class="btn small" data-action="group-settings" data-id="${esc(g.id)}">团队设置</button><button class="btn small" data-action="group-members" data-id="${esc(g.id)}">查看成员</button>${['owner','admin'].includes(g.role)?`<button class="btn small" data-action="invite-group" data-id="${esc(g.id)}">邀请成员</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('和团队一起整理发票','创建群组，或输入邀请码加入已有群组。你的个人发票不会自动对群组可见。','<button class="btn primary" data-action="new-group">创建第一个群组</button><button class="btn ghost" data-action="join-group">使用邀请码</button>','♧')}</div>`}`;
+}
+function groupSettings(groupId) {
+  const group=(state.groups || []).find(g=>g.id===groupId);
+  if(!group)return;
+  const managing=['owner','admin'].includes(group.role);
+  const disabled=managing?'':'disabled';
+  const content=`<div class="form-stack"><label class="field"><span>团队名称</span><input name="name" value="${esc(group.name)}" maxlength="100" required ${disabled}></label><label class="field"><span>团队说明</span><textarea name="description" maxlength="1000" placeholder="填写团队用途或协作约定" ${disabled}>${esc(group.description || '')}</textarea></label><div class="group-settings-summary"><span>${group.member_count || 1} 位成员 · ${esc(roleName(group.role))}</span><button type="button" class="btn small" data-action="group-members" data-id="${esc(groupId)}">${managing?'管理成员':'查看成员'}</button></div><p class="hint">发票始终归上传者所有。退出或移除成员会停止其在本团队的分享，取消涉及其发票或由其创建的未完成报销单；原件保留，已报销状态不变。</p><div class="group-lifecycle">${group.role==='owner'?`<div><div><h3>转让团队</h3><p>选择一位成员接任群主，你将成为管理员，之后可退出。</p></div><button type="button" class="btn small" data-action="transfer-group" data-id="${esc(groupId)}">转让群主</button></div><div><div><h3>解散团队</h3><p>撤销所有分享，取消未完成报销；历史报销单由创建人保留。团队收票配置转回创建人并暂停。</p></div><button type="button" class="btn danger small" data-action="dissolve-group" data-id="${esc(groupId)}">解散团队</button></div>`:`<div><div><h3>退出团队</h3><p>个人发票保留，团队收票配置转回你的个人空间并暂停。</p></div><button type="button" class="btn danger small" data-action="leave-group" data-id="${esc(groupId)}" data-name="${esc(group.name)}">退出团队</button></div>`}</div></div>`;
+  openModal('团队设置','管理团队资料、成员与协作关系。',content,`<button type="button" class="btn" data-action="close-modal">关闭</button>${managing?'<button type="submit" class="btn primary">保存设置</button>':''}`,managing?'group-settings':'',`data-id="${esc(groupId)}"`);
+}
+async function transferGroupModal(groupId) {
+  const group=(state.groups || []).find(g=>g.id===groupId);
+  if(!group || group.role!=='owner')return;
+  const members=await api(`/api/groups/${encodeURIComponent(groupId)}/members`);
+  const candidates=members.filter(m=>m.id!==currentUser.id);
+  openModal('转让群主',esc(group.name),candidates.length?`<div class="form-stack"><label class="field"><span>新群主</span><select name="member_id" required><option value="">请选择团队成员</option>${candidates.map(m=>`<option value="${esc(m.id)}">${esc(m.name)} · ${esc(m.email)}</option>`).join('')}</select></label><p class="hint warn">新群主将拥有管理员设置、移除成员和解散团队等权限。你将成为管理员，发票归属保持不变。</p></div>`:'<p class="hint">团队中还没有其他成员，请先邀请一位成员加入。</p>',`<button type="button" class="btn" data-action="group-settings" data-id="${esc(groupId)}">返回设置</button>${candidates.length?'<button type="submit" class="btn primary">确认转让</button>':''}`,candidates.length?'transfer-group':'',`data-id="${esc(groupId)}"`);
+}
+function dissolveGroupModal(groupId) {
+  const group=(state.groups || []).find(g=>g.id===groupId);
+  if(!group || group.role!=='owner')return;
+  openModal('解散团队',esc(group.name),`<div class="form-stack"><p class="hint warn">解散后无法恢复团队。所有发票停止在本团队共享，原件归原上传者保留；未完成报销单将取消，已报销状态不变。历史报销单由创建人保留，团队项目和额度删除。团队收票配置转回创建人的个人空间并暂停。</p><label class="field"><span>输入团队名称“${esc(group.name)}”确认解散</span><input name="confirmation" required autocomplete="off" maxlength="100"></label></div>`,`<button type="button" class="btn" data-action="group-settings" data-id="${esc(groupId)}">返回设置</button><button type="submit" class="btn danger">确认解散</button>`,'dissolve-group',`data-id="${esc(groupId)}" data-name="${esc(group.name)}"`);
+}
+function resetDepartedGroup(groupId) {
+  selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
+  if(activeGroupId!==groupId)return;
+  activeGroupId='';localStorage.removeItem('invoice.activeGroup');
+  filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
+  matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
 }
 async function showMembers(groupId) {
   const group=(state.groups || []).find(g=>g.id===groupId);
@@ -539,7 +566,7 @@ async function showMembers(groupId) {
   const response=await api(`/api/groups/${encodeURIComponent(groupId)}/members`);
   const members=Array.isArray(response)?response:(response.members || []);
   const managing=['owner','admin'].includes(group.role);
-  openModal(esc(group.name)+' · 成员',`${members.length} 位成员`, `<div class="members-list">${members.map(member=>`<div class="member-row"><div class="member-avatar">${esc((member.name || member.email).slice(0,1))}</div><div class="member-info"><strong>${esc(member.name || member.email)}${member.id===currentUser.id?' <span class="text-muted">（我）</span>':''}</strong><small>${esc(member.email)}</small></div><div class="member-actions"><span class="badge">${esc(roleName(member.role))}</span>${group.role==='owner' && member.role!=='owner' && member.id!==currentUser.id?`<button class="link-button" data-action="member-role" data-group="${esc(groupId)}" data-id="${esc(member.id)}" data-role="${member.role==='admin'?'member':'admin'}">${member.role==='admin'?'取消管理':'设为管理'}</button>`:''}${managing && member.role!=='owner' && member.id!==currentUser.id && (group.role==='owner'||member.role==='member')?`<button class="link-button danger-text" data-action="remove-member" data-group="${esc(groupId)}" data-id="${esc(member.id)}" data-name="${esc(member.name || member.email)}">移出</button>`:''}</div></div>`).join('')}</div>`,`${group.role!=='owner'?`<button class="btn danger left" data-action="leave-group" data-id="${esc(groupId)}" data-name="${esc(group.name)}">退出群组</button>`:''}${managing?`<button class="btn primary" data-action="invite-group" data-id="${esc(groupId)}">邀请成员</button>`:''}<button class="btn" data-action="close-modal">关闭</button>`);
+  openModal(esc(group.name)+' · 成员',`${members.length} 位成员`, `<div class="members-list">${members.map(member=>`<div class="member-row"><div class="member-avatar">${esc((member.name || member.email).slice(0,1))}</div><div class="member-info"><strong>${esc(member.name || member.email)}${member.id===currentUser.id?' <span class="text-muted">（我）</span>':''}</strong><small>${esc(member.email)}</small></div><div class="member-actions"><span class="badge">${esc(roleName(member.role))}</span>${group.role==='owner' && member.role!=='owner' && member.id!==currentUser.id?`<button type="button" class="link-button" data-action="member-role" data-group="${esc(groupId)}" data-id="${esc(member.id)}" data-role="${member.role==='admin'?'member':'admin'}">${member.role==='admin'?'取消管理':'设为管理'}</button>`:''}${managing && member.role!=='owner' && member.id!==currentUser.id && (group.role==='owner'||member.role==='member')?`<button class="link-button danger-text" data-action="remove-member" data-group="${esc(groupId)}" data-id="${esc(member.id)}" data-name="${esc(member.name || member.email)}">移出</button>`:''}</div></div>`).join('')}</div>`,`${group.role!=='owner'?`<button class="btn danger left" data-action="leave-group" data-id="${esc(groupId)}" data-name="${esc(group.name)}">退出群组</button>`:''}${managing?`<button class="btn primary" data-action="invite-group" data-id="${esc(groupId)}">邀请成员</button>`:''}<button class="btn" data-action="close-modal">关闭</button>`);
 }
 async function showShares(invoiceId) {
   const response=await api(`/api/invoices/${encodeURIComponent(invoiceId)}/shares`);
@@ -602,7 +629,17 @@ async function submitOnlineForm(form) {
       }
       toast(kind==='profile'?'个人资料已保存。':'密码已修改，其他设备需要重新登录。');
     }else if(kind==='group'){
-      await api('/api/groups',{method:'POST',body:JSON.stringify({name:data.name.trim()})});modal.close();await refresh();toast('群组已创建。');
+      await api('/api/groups',{method:'POST',body:JSON.stringify({name:data.name.trim(),description:data.description.trim()})});modal.close();await refresh();toast('群组已创建。');
+    }else if(kind==='group-settings'){
+      await api(`/api/groups/${encodeURIComponent(form.dataset.id)}`,{method:'PATCH',body:JSON.stringify({name:data.name.trim(),description:data.description.trim()})});
+      modal.close();await refresh();toast('团队设置已保存。');
+    }else if(kind==='transfer-group'){
+      await api(`/api/groups/${encodeURIComponent(form.dataset.id)}/transfer`,{method:'POST',body:JSON.stringify({member_id:data.member_id})});
+      modal.close();await refresh();toast('群主已转让，你现在是管理员。');
+    }else if(kind==='dissolve-group'){
+      if(data.confirmation!==form.dataset.name)throw new Error('输入的团队名称不一致。');
+      await api(`/api/groups/${encodeURIComponent(form.dataset.id)}`,{method:'DELETE'});
+      resetDepartedGroup(form.dataset.id);modal.close();await refresh();toast('团队已解散，发票仍归原上传者所有。');
     }else if(kind==='join-group'){
       await api('/api/groups/join',{method:'POST',body:JSON.stringify({token:data.token.trim()})});modal.close();await refresh();toast('已加入群组。');
     }else if(kind==='shares'){
@@ -632,7 +669,7 @@ document.addEventListener('click',async event=>{
     await runMutation(button,async()=>{await api('/api/auth/logout',{method:'POST'});currentUser=null;activeGroupId='';localStorage.removeItem('invoice.activeGroup');state={invoices:[],projects:[],quotas:[],batches:[],summary:{},capabilities:{},groups:[]};selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();modal.close();renderAuth();});return;
   }
   if(action==='new-group'){
-    openModal('创建群组','邀请团队成员，共同整理指定的发票。','<label class="field"><span>群组名称</span><input name="name" placeholder="例如：行政报销小组" maxlength="100" required></label>','<button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">创建群组</button>','group');return;
+    openModal('创建群组','邀请团队成员，共同整理指定的发票。','<div class="form-stack"><label class="field"><span>群组名称</span><input name="name" placeholder="例如：行政报销小组" maxlength="100" required></label><label class="field"><span>团队说明</span><textarea name="description" maxlength="1000" placeholder="填写团队用途或协作约定（选填）"></textarea></label></div>','<button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">创建群组</button>','group');return;
   }
   if(action==='join-group'){
     openModal('加入群组','向群主或管理员获取邀请码。','<label class="field"><span>邀请码</span><input name="token" placeholder="粘贴完整邀请码" autocomplete="off" required></label>','<button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">加入群组</button>','join-group');return;
@@ -640,6 +677,9 @@ document.addEventListener('click',async event=>{
   if(action==='open-group'){await switchGroup(id);location.hash='invoices';return;}
   if(action==='personal-space'){await switchGroup('');return;}
   if(action==='go-groups'){modal.close();location.hash='groups';return;}
+  if(action==='group-settings'){groupSettings(id);return;}
+  if(action==='transfer-group'){await runMutation(button,()=>transferGroupModal(id));return;}
+  if(action==='dissolve-group'){dissolveGroupModal(id);return;}
   if(action==='group-members'){await runMutation(button,()=>showMembers(id));return;}
   if(action==='invoice-shares'){await runMutation(button,()=>showShares(id));return;}
   if(action==='invite-group'){
@@ -653,23 +693,19 @@ document.addEventListener('click',async event=>{
     try{await navigator.clipboard.writeText($('#invite-token').value);toast('邀请码已复制。');}catch(_){$('#invite-token').select();toast('请复制选中的邀请码。');}return;
   }
   if(action==='member-role'){
-    await runMutation(button,async()=>{await api(`/api/groups/${encodeURIComponent(button.dataset.group)}/members/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({role:button.dataset.role})});await showMembers(button.dataset.group);toast('成员角色已更新。');});return;
+    await runMutation(button,async()=>{await api(`/api/groups/${encodeURIComponent(button.dataset.group)}/members/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({role:button.dataset.role})});await refresh();await showMembers(button.dataset.group);toast('成员角色已更新。');});return;
   }
   if(action==='leave-group'){
-    if(!confirm(`退出“${button.dataset.name}”？你将无法继续访问群组票库，你分享至本组的发票也会停止共享；个人票库中的原始发票会保留。`))return;
+    if(!confirm(`退出“${button.dataset.name}”？你的发票将停止在本团队共享，涉及你的发票或由你创建的未完成报销单会取消。原件和已报销状态保留，团队收票配置转回你的个人空间并暂停。`))return;
     await runMutation(button,async()=>{
       await api(`/api/groups/${encodeURIComponent(id)}/members/${encodeURIComponent(currentUser.id)}`,{method:'DELETE'});
-      if(activeGroupId===id){
-        activeGroupId='';localStorage.removeItem('invoice.activeGroup');selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
-        filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
-        matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
-      }
+      resetDepartedGroup(id);
       modal.close();await refresh();toast('已退出群组，个人发票保留。');
     });return;
   }
   if(action==='remove-member'){
-    if(!confirm(`将“${button.dataset.name}”移出群组？对方将无法继续访问群组发票。`))return;
-    await runMutation(button,async()=>{await api(`/api/groups/${encodeURIComponent(button.dataset.group)}/members/${encodeURIComponent(id)}`,{method:'DELETE'});await refresh();await showMembers(button.dataset.group);toast('成员已移出群组。');});return;
+    if(!confirm(`将“${button.dataset.name}”移出团队？对方的发票将停止在本团队共享，涉及其发票或由其创建的未完成报销单会取消。原件及已报销状态保留，团队收票配置转回对方的个人空间并暂停。`))return;
+    await runMutation(button,async()=>{await api(`/api/groups/${encodeURIComponent(button.dataset.group)}/members/${encodeURIComponent(id)}`,{method:'DELETE'});selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();await refresh();await showMembers(button.dataset.group);toast('成员已移出群组，发票仍归原上传者所有。');});return;
   }
   if(action==='reload-mailboxes'){mailboxData=null;await loadMailboxes();return;}
   if(action==='mailbox-results'){

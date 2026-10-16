@@ -9,6 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from app import db, main, inbound
 
@@ -158,6 +159,45 @@ class InboundTests(unittest.TestCase):
         self.assertEqual(self.service.post('/api/inbound/email',content=raw).status_code,401)
         with db.connection() as connection:
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM inbound_deliveries').fetchone()[0],0)
+
+    def test_dissolve_pauses_receivers_and_delivers_already_queued_mail_to_owner(self):
+        group = self.ok(self.client.post('/api/groups', json={'name':'收票团队'}))
+        address = self.address('dissolving-team', group_id=group['id'])
+        raw = self.mail(('queued.xml', self.xml('QUEUED-RETURN')))
+        self.send(raw, address['address'])
+        self.ok(self.client.delete('/api/groups/'+group['id']))
+        returned = self.ok(self.client.get('/api/receipt-addresses'))['addresses'][0]
+        self.assertIsNone(returned['group_id'])
+        self.assertFalse(returned['enabled'])
+        self.assertEqual(returned['owner_id'], address['owner_id'])
+        self.assertEqual(self.other.get('/api/receipt-addresses').json()['addresses'], [])
+        self.assertEqual(inbound.process_pending(), 1)
+        invoices = self.ok(self.client.get('/api/state'))['invoices']
+        self.assertEqual((invoices[0]['number'],invoices[0]['owner_id'],invoices[0]['shared_group_ids']), ('QUEUED-RETURN',address['owner_id'],[]))
+        self.assertEqual(self.client.get(invoices[0]['file_url']).status_code, 200)
+        records = self.ok(self.client.get(f"/api/receipt-addresses/{address['id']}/deliveries"))['deliveries']
+        self.assertEqual(records[0]['status'], 'completed')
+        self.assertEqual(self.service.post('/api/inbound/email', content=raw, headers=self.signature(raw,address['address'])).status_code, 404)
+
+    def test_inflight_mail_import_after_departure_uses_personal_scope(self):
+        group = self.ok(self.client.post('/api/groups', json={'name':'转让团队'}))
+        owner = self.ok(self.client.get('/api/state'))['user']['id']
+        next_owner = self.ok(self.other.get('/api/state'))['user']['id']
+        invite = self.ok(self.client.post(f"/api/groups/{group['id']}/invites"))['token']
+        self.ok(self.other.post('/api/groups/join', json={'token':invite}))
+        self.ok(self.client.post(f"/api/groups/{group['id']}/transfer", json={'member_id':next_owner}))
+        parse = main.parse_invoice
+        def depart_during_parse(data, filename):
+            self.ok(self.client.delete(f"/api/groups/{group['id']}/members/{owner}"))
+            return parse(data, filename)
+        with patch.object(main, 'parse_invoice', side_effect=depart_during_parse):
+            item = main.persist_mail_import(self.xml('INFLIGHT-RETURN'), 'inflight.xml', owner, group['id'])['invoice']
+        self.assertEqual((item['owner_id'],item['shared_group_ids']), (owner,[]))
+        self.assertEqual(self.ok(self.other.get('/api/state', params={'group_id':group['id']}))['invoices'], [])
+        self.assertEqual(self.other.get(item['file_url']).status_code, 403)
+        with self.assertRaises(HTTPException) as caught:
+            main.persist_import(self.xml('HTTP-REJECT'), 'manual.xml', owner, group['id'])
+        self.assertEqual(caught.exception.status_code, 403)
 
     def test_group_permission_and_stopped_address_keeps_ownership(self):
         group = self.ok(self.client.post('/api/groups',json={'name':'收票组'}))

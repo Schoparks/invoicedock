@@ -19,7 +19,7 @@ def _now():
 
 
 def _group(db, group_id, user_id):
-    row = db.execute('''SELECT g.id,g.name,m.role,
+    row = db.execute('''SELECT g.id,g.name,g.description,g.created_by,g.created_at,m.role,
         (SELECT COUNT(*) FROM group_members WHERE group_id=g.id) AS member_count
         FROM groups g JOIN group_members m ON m.group_id=g.id WHERE g.id=? AND m.user_id=?''',
         (group_id, user_id)).fetchone()
@@ -44,22 +44,102 @@ def _active_share(db, invoice_id, group_id):
 @router.get('/api/groups')
 def list_groups(user: dict = Depends(require_user)):
     with connection() as db:
-        return [dict(row) for row in db.execute('''SELECT g.id,g.name,m.role,
+        return [dict(row) for row in db.execute('''SELECT g.id,g.name,g.description,g.created_by,g.created_at,m.role,
             (SELECT COUNT(*) FROM group_members WHERE group_id=g.id) AS member_count
             FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=?
             ORDER BY g.created_at,g.id''', (user['id'],))]
 
 
-@router.post('/api/groups')
-def create_group(values: dict, user: dict = Depends(require_user)):
-    name = values.get('name', '')
+def _details(values, old=None):
+    name = values.get('name', old['name'] if old else '')
+    description = values.get('description', old['description'] if old else '')
     if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100:
         raise HTTPException(400, '组名须为 1 至 100 个字符')
+    if not isinstance(description, str) or len(description.strip()) > 1000:
+        raise HTTPException(400, '团队说明最多 1,000 个字符')
+    return name.strip(), description.strip()
+
+
+def _cancel_batches(db, group_id, member_id=None):
+    # Cancel complete batches to retain snapshots and totals, releasing only their current claims.
+    sql = "SELECT id FROM batches WHERE group_id=? AND status IN ('draft','submitted')"
+    args = [group_id]
+    if member_id:
+        sql += """ AND (owner_id=? OR id IN (SELECT bi.batch_id FROM batch_items bi
+            JOIN invoices i ON i.id=bi.invoice_id WHERE i.owner_id=?))"""
+        args.extend([member_id, member_id])
+    batch_ids = [row['id'] for row in db.execute(sql, args)]
+    for batch_id in batch_ids:
+        db.execute("UPDATE invoices SET status='available',batch_id=NULL WHERE batch_id=?", (batch_id,))
+        db.execute("UPDATE batches SET status='cancelled',updated_at=? WHERE id=?", (_now(), batch_id))
+    return len(batch_ids)
+
+
+def _detach_receivers(db, group_id, member_id=None):
+    # Preserve credentials, receipt history and queued mail for the original account.
+    for table in ('mailboxes', 'receipt_addresses'):
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            continue
+        sql = f'UPDATE {table} SET group_id=NULL,enabled=0 WHERE group_id=?'
+        args = [group_id]
+        if member_id:
+            sql += ' AND owner_id=?'
+            args.append(member_id)
+        db.execute(sql, args)
+
+
+@router.post('/api/groups')
+def create_group(values: dict, user: dict = Depends(require_user)):
+    name, description = _details(values)
     with LOCK, connection(write=True) as db:
         group_id, stamp = uuid.uuid4().hex, _now()
-        db.execute('INSERT INTO groups VALUES (?,?,?,?)', (group_id, name.strip(), user['id'], stamp))
+        db.execute('INSERT INTO groups(id,name,created_by,created_at,description) VALUES (?,?,?,?,?)',
+                   (group_id, name, user['id'], stamp, description))
         db.execute('INSERT INTO group_members VALUES (?,?,?,?)', (group_id, user['id'], 'owner', stamp))
         return _group(db, group_id, user['id'])
+
+
+@router.patch('/api/groups/{group_id}')
+def update_group(group_id: str, values: dict, user: dict = Depends(require_user)):
+    with LOCK, connection(write=True) as db:
+        require_group(db, user['id'], group_id, admin=True)
+        old = _group(db, group_id, user['id'])
+        name, description = _details(values, old)
+        db.execute('UPDATE groups SET name=?,description=? WHERE id=?', (name, description, group_id))
+        return _group(db, group_id, user['id'])
+
+
+@router.post('/api/groups/{group_id}/transfer')
+def transfer_group(group_id: str, values: dict, user: dict = Depends(require_user)):
+    member_id = values.get('member_id')
+    if not isinstance(member_id, str) or not member_id or member_id == user['id']:
+        raise HTTPException(400, '请选择另一位团队成员接任群主')
+    with LOCK, connection(write=True) as db:
+        actor = require_group(db, user['id'], group_id)
+        if actor['role'] != 'owner':
+            raise HTTPException(403, '仅群主可转让团队')
+        require_group(db, member_id, group_id)
+        db.execute("UPDATE group_members SET role='admin' WHERE group_id=? AND user_id=?", (group_id, user['id']))
+        db.execute("UPDATE group_members SET role='owner' WHERE group_id=? AND user_id=?", (group_id, member_id))
+        # created_by records the original creator, while membership holds current ownership.
+        return _group(db, group_id, user['id'])
+
+
+@router.delete('/api/groups/{group_id}')
+def dissolve_group(group_id: str, user: dict = Depends(require_user)):
+    with LOCK, connection(write=True) as db:
+        actor = require_group(db, user['id'], group_id)
+        if actor['role'] != 'owner':
+            raise HTTPException(403, '仅群主可解散团队')
+        cancelled = _cancel_batches(db, group_id)
+        _detach_receivers(db, group_id)
+        # Historical batches remain private to their creators, with invoice snapshots intact.
+        db.execute('UPDATE batches SET group_id=NULL,project_id=NULL,quota_id=NULL WHERE group_id=?', (group_id,))
+        db.execute('UPDATE invoices SET project_id=NULL WHERE project_id IN (SELECT id FROM projects WHERE group_id=?)', (group_id,))
+        db.execute('DELETE FROM projects WHERE group_id=?', (group_id,))
+        db.execute('DELETE FROM quotas WHERE group_id=?', (group_id,))
+        db.execute('DELETE FROM groups WHERE id=?', (group_id,))
+    return {'ok': True, 'cancelled_batches': cancelled}
 
 
 @router.get('/api/groups/{group_id}/members')
@@ -107,28 +187,16 @@ def remove_member(group_id: str, member_id: str, user: dict = Depends(require_us
         actor = require_group(db, user['id'], group_id)
         target = require_group(db, member_id, group_id)
         if target['role'] == 'owner':
-            raise HTTPException(409, '组创建者暂不可退出或移除')
+            raise HTTPException(409, '群主须先转让团队后退出，或解散团队；不能移除群主')
         if member_id != user['id']:
             if actor['role'] not in ('owner', 'admin') or (actor['role'] == 'admin' and target['role'] != 'member'):
                 raise HTTPException(403, '无权移除此成员')
-        busy = db.execute('''SELECT 1 FROM invoices i JOIN batch_items bi ON bi.invoice_id=i.id
-            JOIN batches b ON b.id=bi.batch_id WHERE i.owner_id=? AND b.group_id=?
-            AND b.status IN ('draft','submitted') LIMIT 1''', (member_id, group_id)).fetchone()
-        if busy:
-            raise HTTPException(409, '该成员的发票正被组报销单占用，请先取消、驳回或完成报销')
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='mailboxes'").fetchone():
-            if db.execute('SELECT 1 FROM mailboxes WHERE owner_id=? AND group_id=? LIMIT 1', (member_id, group_id)).fetchone():
-                raise HTTPException(409, '该成员仍有组邮箱配置，请先删除对应邮箱后再退出或移除')
-        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='receipt_addresses'").fetchone():
-            live_address = db.execute('SELECT 1 FROM receipt_addresses WHERE owner_id=? AND group_id=? AND enabled=1 LIMIT 1', (member_id, group_id)).fetchone()
-            queued_mail = db.execute("""SELECT 1 FROM inbound_deliveries d JOIN receipt_addresses a ON a.id=d.address_id
-                WHERE a.owner_id=? AND a.group_id=? AND d.status IN ('queued','processing') LIMIT 1""", (member_id, group_id)).fetchone()
-            if live_address or queued_mail:
-                raise HTTPException(409, '请先停用该成员创建的组收票地址，并等待已接收邮件处理完成后再退出或移除')
+        cancelled = _cancel_batches(db, group_id, member_id)
+        _detach_receivers(db, group_id, member_id)
         db.execute('DELETE FROM invoice_shares WHERE group_id=? AND invoice_id IN (SELECT id FROM invoices WHERE owner_id=?)', (group_id, member_id))
         db.execute('DELETE FROM group_invites WHERE group_id=? AND created_by=?', (group_id, member_id))
         db.execute('DELETE FROM group_members WHERE group_id=? AND user_id=?', (group_id, member_id))
-    return {'ok': True}
+    return {'ok': True, 'cancelled_batches': cancelled}
 
 
 @router.patch('/api/groups/{group_id}/members/{member_id}')
@@ -139,10 +207,10 @@ def change_role(group_id: str, member_id: str, values: dict, user: dict = Depend
     with LOCK, connection(write=True) as db:
         actor = require_group(db, user['id'], group_id)
         if actor['role'] != 'owner':
-            raise HTTPException(403, '仅组创建者可调整管理员角色')
+            raise HTTPException(403, '仅群主可调整管理员角色')
         target = require_group(db, member_id, group_id)
         if target['role'] == 'owner':
-            raise HTTPException(409, '组创建者角色不能修改')
+            raise HTTPException(409, '群主角色须通过转让团队修改')
         db.execute('UPDATE group_members SET role=? WHERE group_id=? AND user_id=?', (role, group_id, member_id))
         if role == 'member':
             db.execute('DELETE FROM group_invites WHERE group_id=? AND created_by=?', (group_id, member_id))

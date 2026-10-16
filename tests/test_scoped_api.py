@@ -82,6 +82,92 @@ class ScopedApiTests(unittest.TestCase):
             self.assertEqual(archive.namelist(), ['原件/001-其他-12.34.xml'])
         self.assertEqual(self.ok(self.a.post('/api/match',json={'target_cents':1234,'group_id':other_gid}))['combinations'][0]['total_cents'],1234)
 
+    def test_leave_cancels_mixed_pending_batch_and_preserves_other_team_shares(self):
+        gid = self.group['id']
+        original = self.upload()
+        member = self.ok(self.b.get('/api/state'))['user']
+        own = self.ok(self.b.post('/api/invoices', json={'seller':'成员商家','date':'2026-10-15','amount_cents':500,'verified':True}))
+        self.ok(self.a.put('/api/invoices/'+original['id']+'/shares', json={'group_ids':[gid,self.group2['id']]}))
+        self.ok(self.b.put('/api/invoices/'+own['id']+'/shares', json={'group_ids':[gid]}))
+        quota = self.ok(self.a.post('/api/quotas', json={'month':'2026-10','category':'全部','amount_cents':10000,'group_id':gid}))
+        batch = self.ok(self.a.post('/api/batches', json={'name':'混合报销','group_id':gid,'quota_id':quota['id'],'invoice_ids':[original['id'],own['id']]}))
+        self.ok(self.a.patch('/api/batches/'+batch['id'], json={'status':'submitted'}))
+        response = self.ok(self.b.delete(f"/api/groups/{gid}/members/{member['id']}"))
+        self.assertEqual(response['cancelled_batches'], 1)
+        self.assertEqual(self.b.get('/api/state', params={'group_id':gid}).status_code, 403)
+        self.assertEqual(self.b.get(original['file_url']).status_code, 403)
+        returned = self.ok(self.b.get('/api/state'))['invoices'][0]
+        self.assertEqual((returned['id'],returned['owner_id'],returned['status'],returned['shared_group_ids']), (own['id'],member['id'],'available',[]))
+        team = self.ok(self.a.get('/api/state', params={'group_id':gid}))
+        self.assertEqual(team['batches'][0]['status'], 'cancelled')
+        self.assertEqual(team['batches'][0]['items'], batch['items'])
+        self.assertEqual(team['quotas'][0]['remaining_cents'], 10000)
+        self.assertEqual([i['id'] for i in team['invoices']], [original['id']])
+        other = self.ok(self.a.get('/api/state', params={'group_id':self.group2['id']}))['invoices'][0]
+        self.assertEqual((other['id'],other['status']), (original['id'],'available'))
+        self.assertEqual(self.a.get(original['file_url']).status_code, 200)
+
+    def test_kick_cancels_departing_creators_batches_but_preserves_paid_claims(self):
+        gid = self.group['id']
+        member = self.ok(self.b.get('/api/state'))['user']
+        original = self.upload()
+        paid = self.ok(self.b.post('/api/invoices', json={'seller':'已报销商家','date':'2026-10-15','amount_cents':600,'verified':True}))
+        self.ok(self.a.put('/api/invoices/'+original['id']+'/shares', json={'group_ids':[gid]}))
+        self.ok(self.b.put('/api/invoices/'+paid['id']+'/shares', json={'group_ids':[gid]}))
+        draft = self.ok(self.b.post('/api/batches', json={'name':'离队成员创建','group_id':gid,'invoice_ids':[original['id']]}))
+        settled = self.ok(self.a.post('/api/batches', json={'name':'已完成报销','group_id':gid,'invoice_ids':[paid['id']]}))
+        self.ok(self.a.patch('/api/batches/'+settled['id'], json={'status':'submitted'}))
+        self.ok(self.a.patch('/api/batches/'+settled['id'], json={'status':'paid'}))
+        self.ok(self.a.delete(f"/api/groups/{gid}/members/{member['id']}"))
+        team = self.ok(self.a.get('/api/state', params={'group_id':gid}))
+        self.assertEqual({b['id']:b['status'] for b in team['batches']}, {draft['id']:'cancelled',settled['id']:'paid'})
+        own = self.ok(self.b.get('/api/state'))['invoices'][0]
+        self.assertEqual((own['id'],own['status'],own['batch_id'],own['shared_group_ids']), (paid['id'],'paid',settled['id'],[]))
+        self.assertEqual(self.b.post('/api/batches', json={'name':'重复报销','invoice_ids':[paid['id']]}).status_code, 409)
+        self.assertEqual(self.ok(self.a.get('/api/state'))['invoices'][0]['status'], 'available')
+
+    def test_dissolve_preserves_originals_private_history_and_other_team(self):
+        gid = self.group['id']
+        original = self.upload()
+        member = self.ok(self.b.get('/api/state'))['user']
+        own = self.ok(self.b.post('/api/invoices', json={'seller':'成员商家','date':'2026-10-15','amount_cents':500,'verified':True}))
+        self.ok(self.a.put('/api/invoices/'+original['id']+'/shares', json={'group_ids':[gid,self.group2['id']]}))
+        self.ok(self.b.put('/api/invoices/'+own['id']+'/shares', json={'group_ids':[gid]}))
+        project = self.ok(self.a.post('/api/projects', json={'name':'团队项目','group_id':gid}))
+        quota = self.ok(self.a.post('/api/quotas', json={'month':'2026-10','category':'全部','amount_cents':10000,'group_id':gid}))
+        self.ok(self.a.patch('/api/invoices/'+original['id'], json={'project_id':project['id']}))
+        history = self.ok(self.b.post('/api/batches', json={'name':'历史报销','group_id':gid,'quota_id':quota['id'],'project_id':project['id'],'invoice_ids':[original['id']]}))
+        self.ok(self.b.patch('/api/batches/'+history['id'], json={'status':'submitted'}))
+        self.ok(self.b.patch('/api/batches/'+history['id'], json={'status':'paid'}))
+        draft = self.ok(self.a.post('/api/batches', json={'name':'未完成报销','group_id':gid,'invoice_ids':[own['id']]}))
+        invite = self.ok(self.a.post(f'/api/groups/{gid}/invites'))['token']
+        self.assertEqual(self.b.delete(f'/api/groups/{gid}').status_code, 403)
+        self.assertEqual(self.c.delete(f'/api/groups/{gid}').status_code, 403)
+        response = self.ok(self.a.delete(f'/api/groups/{gid}'))
+        self.assertEqual(response['cancelled_batches'], 1)
+        self.assertEqual(self.c.post('/api/groups/join', json={'token':invite}).status_code, 400)
+        self.assertEqual(self.a.get('/api/state', params={'group_id':gid}).status_code, 403)
+        personal_a, personal_b = self.ok(self.a.get('/api/state')), self.ok(self.b.get('/api/state'))
+        self.assertEqual([g['id'] for g in personal_a['groups']], [self.group2['id']])
+        self.assertEqual(personal_b['groups'], [])
+        self.assertEqual((personal_a['invoices'][0]['id'],personal_a['invoices'][0]['status']), (original['id'],'paid'))
+        self.assertEqual((personal_b['invoices'][0]['id'],personal_b['invoices'][0]['owner_id'],personal_b['invoices'][0]['status']), (own['id'],member['id'],'available'))
+        self.assertIsNone(personal_a['invoices'][0]['project_id'])
+        self.assertEqual(personal_b['batches'][0]['items'], history['items'])
+        self.assertEqual(personal_b['batches'][0]['status'], 'paid')
+        self.assertEqual(personal_a['batches'][0]['status'], 'cancelled')
+        self.assertEqual(self.b.get(history['items'][0]['file_url']).status_code, 200)
+        self.assertEqual(self.c.get(history['items'][0]['file_url']).status_code, 403)
+        self.assertEqual(self.a.get('/api/batches/'+history['id']+'/export').status_code, 403)
+        self.assertEqual(self.a.get(original['file_url']).status_code, 200)
+        self.assertEqual(self.b.get(original['file_url']).status_code, 403)
+        self.assertEqual(self.a.get('/api/batches/'+draft['id']+'/export').status_code, 200)
+        with db.connection() as connection:
+            self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(), [])
+            self.assertIsNone(connection.execute('SELECT id FROM projects WHERE id=?', (project['id'],)).fetchone())
+            self.assertIsNone(connection.execute('SELECT id FROM quotas WHERE id=?', (quota['id'],)).fetchone())
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM batch_items').fetchone()[0], 2)
+
     def test_personal_export_and_scoped_quotas_do_not_leak(self):
         invoice = self.upload()
         gid = self.group['id']

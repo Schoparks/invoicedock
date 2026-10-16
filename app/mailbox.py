@@ -369,7 +369,9 @@ def update_mailbox(mailbox_id: str, values: dict, user=Depends(require_user)):
         columns = ('name', 'address', 'host', 'port', 'username', 'password_encrypted', 'folder',
                    'group_id', 'enabled', 'uid_validity', 'last_uid')
         with LOCK, connection(write=True) as db:
-            _get_managed(db, mailbox_id, user['id'])
+            current = _get_managed(db, mailbox_id, user['id'])
+            if current['group_id'] != old['group_id']:
+                raise HTTPException(409, '邮箱归属已变化，请刷新后重新设置')
             db.execute(f"UPDATE mailboxes SET {','.join(key+'=?' for key in columns)},last_error='' WHERE id=?", [*[data[key] for key in columns], mailbox_id])
             if changed_inbox:
                 db.execute('DELETE FROM mail_results WHERE mailbox_id=?', (mailbox_id,))

@@ -156,9 +156,9 @@ async def lifespan(app):
         raise RuntimeError('线上模式需要 COOKIE_SECURE=true，并通过 HTTPS 反向代理访问')
     initialize()
     mailbox.initialize_mailboxes()
-    mailbox.configure_importer(persist_import)
+    mailbox.configure_importer(persist_mail_import)
     inbound.initialize_inbound()
-    inbound.configure_importer(persist_import)
+    inbound.configure_importer(persist_mail_import)
     mailbox.start_mailbox_worker()
     inbound.start_inbound_worker()
     try:
@@ -252,7 +252,7 @@ def state(group_id: str | None = None, user: dict = Depends(require_user)):
         for batch in batches:
             role = require_group(db, user['id'], group_id)['role'] if group_id else None
             batch['can_manage'] = batch['owner_id'] == user['id'] or role in ('owner', 'admin')
-        groups = [dict(r) for r in db.execute('SELECT g.id,g.name,m.role,(SELECT COUNT(*) FROM group_members m2 WHERE m2.group_id=g.id) AS member_count FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=? ORDER BY g.created_at', (user['id'],))]
+        groups = [dict(r) for r in db.execute('SELECT g.id,g.name,g.description,g.created_by,g.created_at,m.role,(SELECT COUNT(*) FROM group_members m2 WHERE m2.group_id=g.id) AS member_count FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=? ORDER BY g.created_at', (user['id'],))]
         return dict(user=user, groups=groups, active_group_id=group_id, invoices=invoices, batches=batches,
             projects=[dict(r) for r in scoped_rows(db, 'projects', user['id'], group_id)],
             quotas=[quota_dict(db, r) for r in scoped_rows(db, 'quotas', user['id'], group_id)],
@@ -310,9 +310,16 @@ def delete_invoice(invoice_id: str, user: dict = Depends(require_user)):
     return {'ok': True}
 
 
-def persist_import(data: bytes, filename: str, owner_id: str, group_id: str | None = None):
+def persist_mail_import(data: bytes, filename: str, owner_id: str, group_id: str | None = None):
+    return persist_import(data, filename, owner_id, group_id, personal_if_group_left=True)
+
+
+def persist_import(data: bytes, filename: str, owner_id: str, group_id: str | None = None, *, personal_if_group_left=False):
     digest = hashlib.sha256(data).hexdigest()
     with LOCK, connection(write=True) as db:
+        if group_id and personal_if_group_left and not db.execute(
+                'SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', (group_id, owner_id)).fetchone():
+            group_id = None
         if group_id:
             require_group(db, owner_id, group_id)
         duplicate = db.execute('SELECT * FROM invoices WHERE file_hash=? AND owner_id=?', (digest, owner_id)).fetchone()
@@ -322,6 +329,9 @@ def persist_import(data: bytes, filename: str, owner_id: str, group_id: str | No
     parsed = parse_invoice(data, filename)
     obsolete_path = None
     with LOCK, connection(write=True) as db:
+        if group_id and personal_if_group_left and not db.execute(
+                'SELECT 1 FROM group_members WHERE group_id=? AND user_id=?', (group_id, owner_id)).fetchone():
+            group_id = None
         if group_id:
             require_group(db, owner_id, group_id)
         duplicate = db.execute('SELECT * FROM invoices WHERE file_hash=? AND owner_id=?', (digest, owner_id)).fetchone()

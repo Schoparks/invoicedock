@@ -84,6 +84,8 @@ def initialize():
             db.execute(statement)
         for table, schema in [('projects', PROJECT_SCHEMA), ('quotas', QUOTA_SCHEMA), ('invoices', INVOICE_SCHEMA)]:
             _scoped_table(db, table, schema)
+        if 'description' not in _columns(db, 'groups'):
+            db.execute("ALTER TABLE groups ADD COLUMN description TEXT NOT NULL DEFAULT ''")
         batch_columns = _columns(db, 'batches')
         for column, reference in [('owner_id', 'users'), ('group_id', 'groups')]:
             if column not in batch_columns:
