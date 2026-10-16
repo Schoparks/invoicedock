@@ -1,11 +1,27 @@
 name = "invoice-receipts"
 main = "cloudflare-email-worker.mjs"
 compatibility_date = "2026-10-15"
-# Use a publicly reachable HTTPS ingress, including for same-zone email events.
 compatibility_flags = ["global_fetch_strictly_public"]
 workers_dev = false
 
 [vars]
-# Replace with your own HTTPS ingress before deployment.
+INVOICE_RECEIPT_DOMAIN = "receipts.example.com"
 INVOICE_INGRESS_URL = "https://invoices.example.com/api/inbound/email"
+# Transport-only option. For IPv6, use a dedicated DNS-only AAAA origin without A.
+# Do not enable until the origin has valid HTTPS and accepts the ingress hostname.
+INVOICE_IPV6_ONLY = "false"
+INVOICE_NOTIFY_FROM = "notices@receipts.example.com"
+INVOICE_NOTIFY_TO = "owner@example.com"
 # Store INVOICE_INBOUND_SECRET with `wrangler secret put`, never in source.
+
+[[r2_buckets]]
+binding = "MAIL_BUCKET"
+bucket_name = "invoice-receipt-mail"
+
+[[send_email]]
+name = "EXPIRY_EMAIL"
+# Must match INVOICE_NOTIFY_TO and be verified in Email Routing destinations.
+destination_address = "owner@example.com"
+
+[triggers]
+crons = ["* * * * *"]
