@@ -5,14 +5,17 @@ const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;',
 const categories = ['餐饮','交通','住宿','办公','通讯','其他'];
 const statusNames = {available:'可报销',draft:'草稿占用',submitted:'已提交',paid:'已报销',cancelled:'已撤销',rejected:'已退回'};
 const batchNames = {...statusNames,draft:'草稿'};
-const pageNames = {invoices:'我的票库',match:'智能匹配',batches:'报销单',settings:'项目与额度',data:'数据管理',groups:'群组管理',mailboxes:'邮箱收票',account:'账号设置'};
+const pageNames = {invoices:'票库',match:'智能匹配',batches:'报销单',settings:'项目与额度',data:'数据管理',groups:'群组管理',mailboxes:'邮箱收票',account:'账号设置'};
 const fmt = cents => (Number(cents || 0) / 100).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
 const localDate = (date = new Date()) => `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,'0')}-${String(date.getDate()).padStart(2,'0')}`;
 const currentMonth = () => localDate().slice(0,7);
 let state = {invoices:[],projects:[],batches:[],quotas:[],summary:{},capabilities:{}};
 let activePage = 'invoices';
 let currentUser = null;
-let activeGroupId = localStorage.getItem('invoice.activeGroup') || '';
+let importGroup = '';
+let batchGroupFilter = '';
+let settingsGroupFilter = '';
+let mailboxGroupFilter = '';
 let registrationOpen = false;
 let authMode = 'login';
 let mailboxData = null;
@@ -21,11 +24,10 @@ let receiptData = null;
 let receiptLoading = false;
 let receiptError = '';
 let receiptGeneration = 0;
-let scopeBusy = false;
 let selected = new Set();
-let filters = {q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
+let filters = {group_id:'',q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
 let batchFilter = '';
-let matchValues = {target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
+let matchValues = {source:'',target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
 let matchData = null;
 let modalBusy = false;
 let toastTimer;
@@ -33,19 +35,7 @@ const modal = $('#modal');
 const preview = $('#original-preview');
 const originalViewers = new Map();
 
-function scopedURL(path) {
-  if (!activeGroupId) return path;
-  const base = path.split('?')[0];
-  if (['/api/state','/api/import','/api/export','/api/backup','/api/mailboxes'].includes(base) || /^\/api\/invoices\/[^/]+$/.test(base)) {
-    return `${path}${path.includes('?')?'&':'?'}group_id=${encodeURIComponent(activeGroupId)}`;
-  }
-  return path;
-}
 async function api(path, options = {}) {
-  if (activeGroupId && options.method === 'POST' && ['/api/invoices','/api/projects','/api/quotas','/api/batches','/api/match'].includes(path) && options.body) {
-    options = {...options,body:JSON.stringify({...JSON.parse(options.body),group_id:activeGroupId})};
-  }
-  path = scopedURL(path);
   const headers = {'X-Requested-With':'InvoiceDesk',...(options.headers || {})};
   if (options.body && !(options.body instanceof FormData)) headers['Content-Type'] = 'application/json';
   const response = await fetch(path,{...options,headers});
@@ -73,15 +63,27 @@ function cents(value) {
   return result;
 }
 function projectName(id) { return state.projects.find(p => p.id === id)?.name || '未分配'; }
-function projectOptions(value = '', allLabel = '全部项目') {
-  return `<option value="">${allLabel}</option>${state.projects.map(p => `<option value="${esc(p.id)}" ${p.id === value ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}`;
+function projectOptions(value = '', allLabel = '全部项目', groupId = '*') {
+  return `<option value="">${allLabel}</option>${state.projects.filter(p=>groupId==='*' || (p.group_id || '')===groupId).map(p => `<option value="${esc(p.id)}" ${p.id === value ? 'selected' : ''}>${esc(p.name)} · ${esc(groupName(p.group_id))}</option>`).join('')}`;
 }
 function categoryOptions(value = '', allLabel = '全部类别') {
   return `<option value="">${allLabel}</option>${categories.map(c => `<option ${c === value ? 'selected' : ''}>${c}</option>`).join('')}`;
 }
-function quotaOptions(value = '') {
-  return `<option value="">不使用额度</option>${state.quotas.map(q => `<option value="${esc(q.id)}" ${value === q.id ? 'selected' : ''}>${esc(q.month)} · ${esc(q.category)} · 剩余 ¥${fmt(q.remaining_cents)}</option>`).join('')}`;
+function quotaOptions(value = '', groupId = '*') {
+  return `<option value="">不使用额度</option>${state.quotas.filter(q=>groupId==='*' || (q.group_id || '')===groupId).map(q => `<option value="${esc(q.id)}" ${value === q.id ? 'selected' : ''}>${esc(groupName(q.group_id))} · ${esc(q.month)} · ${esc(q.category)} · 剩余 ¥${fmt(q.remaining_cents)}</option>`).join('')}`;
 }
+function groupName(id) { return id ? (state.groups || []).find(g=>g.id===id)?.name || '群组' : '个人'; }
+function groupOptions(value = '', {all = false, admin = false, groups = state.groups || []} = {}) {
+  return `${all?'<option value="">全部归属</option><option value="personal" '+(value==='personal'?'selected':'')+'>个人</option>':'<option value="">个人</option>'}${groups.filter(g=>!admin || ['owner','admin'].includes(g.role)).map(g=>`<option value="${esc(g.id)}" ${g.id===value?'selected':''}>${esc(g.name)}</option>`).join('')}`;
+}
+function sourceOptions(value = '') {
+  return `<option value="">全部发票</option><option value="personal" ${value==='personal'?'selected':''}>个人发票</option><option value="owned" ${value==='owned'?'selected':''}>本人全部发票</option>${(state.groups || []).map(g=>`<option value="${esc(g.id)}" ${g.id===value?'selected':''}>${esc(g.name)}</option>`).join('')}`;
+}
+function invoiceSource(invoice) {
+  const groups = invoice.groups || [];
+  return `<div class="invoice-source">${groups.length?groups.map(g=>`<span class="tag">${esc(g.name)}</span>`).join(''):'<span class="tag">个人</span>'}<span class="invoice-sub">${invoice.owner_id===currentUser?.id?'本人':esc(invoice.owner_name || '群组成员')}</span></div>`;
+}
+function matchesGroup(row, value) { return !value || (row.group_id || 'personal')===value; }
 function invoiceBadge(invoice) {
   if (invoice.status === 'available' && !invoice.verified) return '<span class="badge review">待核对</span>';
   return `<span class="badge ${esc(invoice.status)}">${esc(statusNames[invoice.status] || invoice.status)}</span>`;
@@ -93,7 +95,7 @@ function empty(title,description,action = '',symbol = '▤') {
   return `<div class="empty-state"><div class="empty-symbol" aria-hidden="true">${symbol}</div><h3>${title}</h3><p>${description}</p>${action ? `<div class="actions">${action}</div>` : ''}</div>`;
 }
 async function refresh({render = true} = {}) {
-  state = await api('/api/state');
+  state = await api('/api/state?unified=true');
   selected = new Set([...selected].filter(id => state.invoices.some(i => i.id === id && i.status === 'available' && i.verified)));
   currentUser = state.user || currentUser;
   updateWorkspaceChrome();
@@ -126,15 +128,17 @@ function renderInvoices() {
   const pending = s.pending_review ?? state.invoices.filter(i => !i.verified).length;
   const available = state.invoices.filter(i => i.verified && i.status === 'available');
   const submitted = state.invoices.filter(i => i.status === 'submitted');
-  return heading('YOUR INVOICE LIBRARY',activeGroupId?'群组票库':'我的票库',activeGroupId?'查看分享至本组的发票，协作整理报销。':'收好每一张发票，让报销井井有条。',`<button class="btn" data-action="new-invoice">手动录入</button><button class="btn primary" data-action="import"><span class="plus">＋</span>导入发票</button>`) +
+  return heading('YOUR INVOICE LIBRARY','票库','收好每一张发票，让报销井井有条。',`<button class="btn" data-action="new-invoice">手动录入</button><button class="btn primary" data-action="import"><span class="plus">＋</span>导入发票</button>`) +
   `<section class="stats" aria-label="票库概览"><div class="stat featured"><div class="stat-label">可报销金额 <span>待使用</span></div><div class="stat-value"><small>¥</small>${fmt(s.available_cents)}</div><p class="stat-note">${available.length} 张已核对发票，随时可用</p></div><div class="stat"><div class="stat-label">待核对发票</div><div class="stat-value">${pending}<small> 张</small></div><p class="stat-note">核对票面信息后即可参与匹配</p></div><div class="stat"><div class="stat-label">已提交 · 等待报销</div><div class="stat-value"><small>¥</small>${fmt(s.submitted_cents)}</div><p class="stat-note">${submitted.length} 张发票已提交</p></div></section>
-  <section class="upload-strip" id="drop-zone" aria-label="拖放导入发票"><div class="upload-mark" aria-hidden="true">↥</div><div class="upload-copy"><h3>把发票放进票栈</h3><p>拖入 PDF、图片、OFD、XML 或 ZIP 批量导入</p></div><button class="btn" data-action="import">选择文件</button></section>
-  <section class="panel" aria-label="发票列表"><div class="filters"><label class="search-field"><span aria-hidden="true">⌕</span><input id="invoice-search" data-filter="q" value="${esc(filters.q)}" placeholder="搜索销售方、发票号码、抬头…" aria-label="搜索发票"></label><select data-filter="category" aria-label="筛选类别">${categoryOptions(filters.category)}</select><select data-filter="status" aria-label="筛选状态"><option value="">全部状态</option>${[['review','待核对'],['available','可报销'],['draft','草稿占用'],['submitted','已提交'],['paid','已报销']].map(([value,label])=>`<option value="${value}" ${filters.status===value?'selected':''}>${label}</option>`).join('')}</select><button class="btn small" data-action="toggle-filters" aria-expanded="false">更多筛选 <span aria-hidden="true">⌄</span></button><div class="filter-details" id="extra-filters" hidden><select data-filter="project_id" aria-label="筛选项目">${projectOptions(filters.project_id)}</select><input type="date" data-filter="date_from" value="${esc(filters.date_from)}" aria-label="最早开票日期"><input type="date" data-filter="date_to" value="${esc(filters.date_to)}" aria-label="最晚开票日期"><input inputmode="decimal" data-filter="min" value="${esc(filters.min)}" placeholder="最低金额（元）" aria-label="最低金额"><input inputmode="decimal" data-filter="max" value="${esc(filters.max)}" placeholder="最高金额（元）" aria-label="最高金额"><button class="btn small ghost" data-action="clear-filters">清空筛选</button></div></div><div class="table-meta"><span id="table-count"></span><span>人民币 CNY</span></div><div id="selection-bar" class="selection-bar" hidden></div><div id="invoice-table"></div></section>`;
+  <section class="upload-strip" id="drop-zone" aria-label="拖放导入发票"><div class="upload-mark" aria-hidden="true">↥</div><div class="upload-copy"><h3>把发票放进票栈</h3><p>拖入 PDF、图片、OFD、XML 或 ZIP 批量导入</p></div><label class="import-destination"><span>导入归属</span><select id="import-group" aria-label="导入发票归属">${groupOptions(importGroup)}</select></label><button class="btn" data-action="import">选择文件</button></section>
+  <section class="panel" aria-label="发票列表"><div class="filters"><label class="search-field"><span aria-hidden="true">⌕</span><input id="invoice-search" data-filter="q" value="${esc(filters.q)}" placeholder="搜索销售方、发票号码、抬头…" aria-label="搜索发票"></label><select data-filter="group_id" aria-label="筛选发票归属">${groupOptions(filters.group_id,{all:true})}</select><select data-filter="category" aria-label="筛选类别">${categoryOptions(filters.category)}</select><select data-filter="status" aria-label="筛选状态"><option value="">全部状态</option>${[['review','待核对'],['available','可报销'],['draft','草稿占用'],['submitted','已提交'],['paid','已报销']].map(([value,label])=>`<option value="${value}" ${filters.status===value?'selected':''}>${label}</option>`).join('')}</select><button class="btn small" data-action="toggle-filters" aria-expanded="false">更多筛选 <span aria-hidden="true">⌄</span></button><div class="filter-details" id="extra-filters" hidden><select data-filter="project_id" aria-label="筛选项目">${projectOptions(filters.project_id)}</select><input type="date" data-filter="date_from" value="${esc(filters.date_from)}" aria-label="最早开票日期"><input type="date" data-filter="date_to" value="${esc(filters.date_to)}" aria-label="最晚开票日期"><input inputmode="decimal" data-filter="min" value="${esc(filters.min)}" placeholder="最低金额（元）" aria-label="最低金额"><input inputmode="decimal" data-filter="max" value="${esc(filters.max)}" placeholder="最高金额（元）" aria-label="最高金额"><button class="btn small ghost" data-action="clear-filters">清空筛选</button></div></div><div class="table-meta"><span id="table-count"></span><span>人民币 CNY</span></div><div id="selection-bar" class="selection-bar" hidden></div><div id="invoice-table"></div></section>`;
 }
 function visibleInvoices() {
   return state.invoices.filter(i => {
     const q = filters.q.trim().toLocaleLowerCase();
     if (q && ![i.seller,i.number,i.buyer,i.note,i.file_name].join(' ').toLocaleLowerCase().includes(q)) return false;
+    if (filters.group_id==='personal' && (i.owner_id!==currentUser?.id || i.groups?.length)) return false;
+    if (filters.group_id && filters.group_id!=='personal' && !i.groups?.some(g=>g.id===filters.group_id)) return false;
     if (filters.category && i.category !== filters.category) return false;
     if (filters.project_id && i.project_id !== filters.project_id) return false;
     if (filters.status === 'review' && i.verified) return false;
@@ -156,7 +160,7 @@ function updateInvoiceTable() {
     return;
   }
   const eligible = invoices.filter(i=>i.verified && i.status === 'available');
-  $('#invoice-table').innerHTML = `<div class="table-scroll"><table><thead><tr><th><input type="checkbox" id="select-all" aria-label="选中当前筛选下所有可报销发票" ${eligible.length && eligible.every(i=>selected.has(i.id))?'checked':''} ${!eligible.length?'disabled':''}></th><th>发票信息</th><th>类别 / 项目</th><th>开票日期</th><th class="align-right">价税合计</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody>${invoices.map(i=>`<tr><td><input type="checkbox" data-select="${esc(i.id)}" aria-label="选择 ${esc(i.seller || i.file_name || '发票')}" ${selected.has(i.id)?'checked':''} ${i.verified && i.status === 'available'?'':'disabled'}></td><td><button class="link-button invoice-title" data-action="edit-invoice" data-id="${esc(i.id)}" title="${esc(i.seller || i.file_name)}">${esc(i.seller || i.file_name || '待补充销售方')}</button><span class="invoice-sub number">${esc(i.number || '待补充发票号码')}</span></td><td><span class="tag">${esc(i.category || '其他')}</span><span class="invoice-sub">${esc(projectName(i.project_id))}${activeGroupId && i.owner_name?' · '+esc(i.owner_name):''}</span></td><td class="number text-muted">${esc(i.date || '待核对')}</td><td class="align-right money">¥ ${fmt(i.amount_cents)}</td><td>${invoiceBadge(i)}</td><td class="align-right"><div class="invoice-row-actions"><button class="link-button" data-action="preview-original" data-url="${esc(i.file_url)}" data-original-id="${esc(i.id)}" data-filename="${esc(i.file_name)}" ${i.file_url?'':'disabled title="此记录没有原件"'}>预览</button><button class="link-button" data-action="edit-invoice" data-id="${esc(i.id)}">${i.status==='available' && i.can_edit!==false?'核对':'查看'}</button></div></td></tr>`).join('')}</tbody></table></div>`;
+  $('#invoice-table').innerHTML = `<div class="table-scroll"><table><thead><tr><th><input type="checkbox" id="select-all" aria-label="选中当前筛选下所有可报销发票" ${eligible.length && eligible.every(i=>selected.has(i.id))?'checked':''} ${!eligible.length?'disabled':''}></th><th>发票信息</th><th>归属 / 上传者</th><th>类别 / 项目</th><th>开票日期</th><th class="align-right">价税合计</th><th>状态</th><th class="align-right">操作</th></tr></thead><tbody>${invoices.map(i=>`<tr><td><input type="checkbox" data-select="${esc(i.id)}" aria-label="选择 ${esc(i.seller || i.file_name || '发票')}" ${selected.has(i.id)?'checked':''} ${i.verified && i.status === 'available'?'':'disabled'}></td><td><button class="link-button invoice-title" data-action="edit-invoice" data-id="${esc(i.id)}" title="${esc(i.seller || i.file_name)}">${esc(i.seller || i.file_name || '待补充销售方')}</button><span class="invoice-sub number">${esc(i.number || '待补充发票号码')}</span></td><td>${invoiceSource(i)}</td><td><span class="tag">${esc(i.category || '其他')}</span><span class="invoice-sub">${esc(projectName(i.project_id))}</span></td><td class="number text-muted">${esc(i.date || '待核对')}</td><td class="align-right money">¥ ${fmt(i.amount_cents)}</td><td>${invoiceBadge(i)}</td><td class="align-right"><div class="invoice-row-actions"><button class="link-button" data-action="preview-original" data-url="${esc(i.file_url)}" data-original-id="${esc(i.id)}" data-filename="${esc(i.file_name)}" ${i.file_url?'':'disabled title="此记录没有原件"'}>预览</button><button class="link-button" data-action="edit-invoice" data-id="${esc(i.id)}">${i.status==='available' && i.can_edit!==false?'核对':'查看'}</button></div></td></tr>`).join('')}</tbody></table></div>`;
 }
 function updateSelection() {
   const bar = $('#selection-bar');
@@ -166,28 +170,30 @@ function updateSelection() {
   bar.innerHTML = `<span>已选 ${selected.size} 张</span><button class="link-button" data-action="clear-selection">取消选择</button><strong>¥ ${fmt(total)}</strong><button class="btn primary small" data-action="create-selected">创建报销草稿</button>`;
 }
 function renderMatch() {
-  return `<div class="page-heading match-heading"><h1>智能匹配</h1><p class="subtitle">给出目标金额，找一组刚刚好的发票。</p></div>` + `<div class="two-column match-layout"><section class="panel match-form" tabindex="0" aria-label="匹配条件"><div class="panel-header"><h2>设置匹配条件</h2></div><form data-form="match" class="panel-body form-stack"><label class="field wide"><span>目标金额（元）</span><div class="currency-input"><input class="target-input" name="target" inputmode="decimal" placeholder="0.00" value="${esc(matchValues.target)}" required autocomplete="off" aria-label="目标金额（元）"></div><small>最多 100,000 元，支持精确到分</small></label><fieldset class="match-direction wide" aria-describedby="match-direction-help"><legend>匹配方式</legend><div class="match-direction-options"><label><input type="radio" name="direction" value="above" ${matchValues.direction==='above'?'checked':''}>稍多</label><label><input type="radio" name="direction" value="below" ${matchValues.direction==='below'?'checked':''}>稍少</label></div><small id="match-direction-help">稍多：恰好或超出最少；稍少：恰好或低于且最接近目标。</small></fieldset><label class="field"><span>发票类别</span><select name="category">${categoryOptions(matchValues.category)}</select></label><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(matchValues.project_id)}</select></label><div class="form-grid wide"><label class="field"><span>开票日期 · 从</span><input type="date" name="date_from" value="${esc(matchValues.date_from)}"></label><label class="field"><span>至</span><input type="date" name="date_to" value="${esc(matchValues.date_to)}"></label></div><label class="field wide"><span>发票抬头</span><input name="buyer" value="${esc(matchValues.buyer)}" placeholder="填写完整抬头，精确匹配"></label><label class="field wide"><span>月度报销额度</span><select name="quota_id">${quotaOptions(matchValues.quota_id)}</select><small>选择额度后，匹配金额受剩余额度约束。</small></label><div class="inline-error wide" data-error></div><button class="btn primary wide" type="submit">开始匹配 <span aria-hidden="true">→</span></button><p class="hint wide">仅使用已核对、未被报销单占用的发票。</p></form></section><section id="match-results" aria-live="polite" tabindex="0" aria-label="匹配结果">${renderMatchResults()}</section></div>`;
+  return `<div class="page-heading match-heading"><h1>智能匹配</h1><p class="subtitle">给出目标金额，找一组刚刚好的发票。</p></div>` + `<div class="two-column match-layout"><section class="panel match-form" tabindex="0" aria-label="匹配条件"><div class="panel-header"><h2>设置匹配条件</h2></div><form data-form="match" class="panel-body form-stack"><label class="field wide"><span>目标金额（元）</span><div class="currency-input"><input class="target-input" name="target" inputmode="decimal" placeholder="0.00" value="${esc(matchValues.target)}" required autocomplete="off" aria-label="目标金额（元）"></div><small>最多 100,000 元，支持精确到分</small></label><fieldset class="match-direction wide" aria-describedby="match-direction-help"><legend>匹配方式</legend><div class="match-direction-options"><label><input type="radio" name="direction" value="above" ${matchValues.direction==='above'?'checked':''}>稍多</label><label><input type="radio" name="direction" value="below" ${matchValues.direction==='below'?'checked':''}>稍少</label></div><small id="match-direction-help">稍多：恰好或超出最少；稍少：恰好或低于且最接近目标。</small></fieldset><label class="field wide"><span>发票来源</span><select name="source">${sourceOptions(matchValues.source)}</select><small>同等金额优先个人发票，其次群组中本人的发票，再选他人的群组发票。</small></label><label class="field"><span>发票类别</span><select name="category">${categoryOptions(matchValues.category)}</select></label><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(matchValues.project_id)}</select></label><div class="form-grid wide"><label class="field"><span>开票日期 · 从</span><input type="date" name="date_from" value="${esc(matchValues.date_from)}"></label><label class="field"><span>至</span><input type="date" name="date_to" value="${esc(matchValues.date_to)}"></label></div><label class="field wide"><span>发票抬头</span><input name="buyer" value="${esc(matchValues.buyer)}" placeholder="填写完整抬头，精确匹配"></label><label class="field wide"><span>月度报销额度</span><select name="quota_id">${quotaOptions(matchValues.quota_id)}</select><small>选择额度后，匹配金额受剩余额度约束。</small></label><div class="inline-error wide" data-error></div><button class="btn primary wide" type="submit">开始匹配 <span aria-hidden="true">→</span></button><p class="hint wide">仅使用已核对、未被报销单占用的发票。</p></form></section><section id="match-results" aria-live="polite" tabindex="0" aria-label="匹配结果">${renderMatchResults()}</section></div>`;
 }
 function renderMatchResults() {
   if (!matchData) return `<div class="panel">${empty('让金额，刚好合适','填写目标金额与筛选条件，票栈会为你寻找可用发票组合。','','⌘')}</div>`;
   if (!matchData.combinations?.length) return `<div class="panel">${empty(matchData.direction==='below'?'暂无合适组合':'额度不足',`${esc(matchData.message)} 本次找到 ${matchData.candidate_count || 0} 张候选发票。`,'<a class="btn" href="#invoices">返回票库</a>','⌘')}</div>`;
   return `<div class="list-head"><h2>可选组合</h2><span class="result-count">${matchData.candidate_count} 张候选 · ${matchData.direction==='below'?'稍少':'稍多'} · ${matchData.combinations.length} 个方案</span></div>${matchData.combinations.map((combo,index)=>{
     const gap = combo.total_cents - matchData.target_cents;
-    return `<article class="match-result"><div class="result-top"><div><h3>方案 ${String(index+1).padStart(2,'0')} ${gap===0?'<span class="badge available">精确匹配</span>':''}</h3><p>${gap===0?'金额刚好，正合所需':`${gap>0?'超出':'低于'}目标 ¥${fmt(Math.abs(gap))}`}</p></div><div class="result-amount">¥ ${fmt(combo.total_cents)}</div></div><div class="mini-list">${combo.invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name || '未命名发票')}<div class="minor">${esc(i.date || '未填写日期')} · ${esc(i.category)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div><div class="result-footer"><span>${combo.invoice_ids.length} 张发票 · 创建后将被草稿占用</span><button class="btn primary small" data-action="use-combination" data-index="${index}">选择此组合</button></div></article>`;
+    return `<article class="match-result"><div class="result-top"><div><h3>方案 ${String(index+1).padStart(2,'0')} ${gap===0?'<span class="badge available">精确匹配</span>':''}</h3><p>${gap===0?'金额刚好，正合所需':`${gap>0?'超出':'低于'}目标 ¥${fmt(Math.abs(gap))}`}</p></div><div class="result-amount">¥ ${fmt(combo.total_cents)}</div></div><div class="mini-list">${combo.invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name || '未命名发票')}<div class="minor">${esc(i.date || '未填写日期')} · ${esc(i.category)} · ${(i.groups || []).map(g=>esc(g.name)).join('、') || '个人'} · ${i.owner_id===currentUser?.id?'本人':esc(i.owner_name || '群组成员')}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div><div class="result-footer"><span>${combo.invoice_ids.length} 张发票 · 创建后将被草稿占用</span><button class="btn primary small" data-action="use-combination" data-index="${index}">选择此组合</button></div></article>`;
   }).join('')}`;
 }
 function renderBatches() {
-  const batches = state.batches.filter(b => !batchFilter || b.status === batchFilter);
-  return heading('REIMBURSEMENT','报销单','从草稿到到账，记录每一次报销。','<a class="btn primary" href="#match">匹配发票建单</a>') + `<div class="tabs" role="group" aria-label="筛选报销单状态">${[['','全部'],['draft','草稿'],['submitted','已提交'],['paid','已报销'],['rejected','已退回'],['cancelled','已撤销']].map(([value,label])=>`<button class="${batchFilter===value?'active':''}" data-action="batch-filter" data-value="${value}">${label}</button>`).join('')}</div>${batches.length?`<div class="batch-grid">${batches.map(b=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(b.name)}</h3><p class="number">${esc(String(b.created_at || '').slice(0,10))} 创建</p></div><span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span></div><div class="batch-total">¥ ${fmt(b.total_cents)}</div><p class="batch-detail">${b.invoice_ids?.length || b.items?.length || 0} 张发票 · ${esc(projectName(b.project_id))} · ${esc(b.month || '')}</p><div class="batch-actions"><button class="btn small" data-action="batch-detail" data-id="${esc(b.id)}">查看明细</button><button class="btn small" data-action="download" data-url="/api/batches/${encodeURIComponent(b.id)}/export" data-filename="报销单.zip">导出报销包</button>${b.can_manage!==false && b.status==='draft'?`<button class="btn primary small" data-action="batch-status" data-id="${esc(b.id)}" data-status="submitted">标记已提交</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button class="btn primary small" data-action="batch-status" data-id="${esc(b.id)}" data-status="paid">标记已报销</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('还没有'+(batchFilter?batchNames[batchFilter]:'')+'报销单','在票库勾选发票，或通过智能匹配选择组合，即可创建一张报销草稿。','<a class="btn primary" href="#match">去匹配发票</a><a class="btn ghost" href="#invoices">去票库选票</a>','☷')}</div>`}`;
+  const batches = state.batches.filter(b => (!batchFilter || b.status === batchFilter) && matchesGroup(b,batchGroupFilter));
+  return heading('REIMBURSEMENT','报销单','从草稿到到账，记录每一次报销。','<a class="btn primary" href="#match">匹配发票建单</a>') + `<div class="page-filters"><label class="field"><span>报销归属</span><select data-view-group="batches">${groupOptions(batchGroupFilter,{all:true})}</select></label></div><div class="tabs" role="group" aria-label="筛选报销单状态">${[['','全部'],['draft','草稿'],['submitted','已提交'],['paid','已报销'],['rejected','已退回'],['cancelled','已撤销']].map(([value,label])=>`<button class="${batchFilter===value?'active':''}" data-action="batch-filter" data-value="${value}">${label}</button>`).join('')}</div>${batches.length?`<div class="batch-grid">${batches.map(b=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(b.name)}</h3><p class="number">${esc(String(b.created_at || '').slice(0,10))} 创建</p></div><span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span></div><div class="batch-total">¥ ${fmt(b.total_cents)}</div><p class="batch-detail">${b.invoice_ids?.length || b.items?.length || 0} 张发票 · ${esc(groupName(b.group_id))} · ${esc(projectName(b.project_id))} · ${esc(b.month || '')}</p><div class="batch-actions"><button class="btn small" data-action="batch-detail" data-id="${esc(b.id)}">查看明细</button><button class="btn small" data-action="download" data-url="/api/batches/${encodeURIComponent(b.id)}/export" data-filename="报销单.zip">导出报销包</button>${b.can_manage!==false && b.status==='draft'?`<button class="btn primary small" data-action="batch-status" data-id="${esc(b.id)}" data-status="submitted">标记已提交</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button class="btn primary small" data-action="batch-status" data-id="${esc(b.id)}" data-status="paid">标记已报销</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('还没有'+(batchFilter?batchNames[batchFilter]:'')+'报销单','在票库勾选发票，或通过智能匹配选择组合，即可创建一张报销草稿。','<a class="btn primary" href="#match">去匹配发票</a><a class="btn ghost" href="#invoices">去票库选票</a>','☷')}</div>`}`;
 }
 function renderSettings() {
-  return heading('KEEP IT ORGANIZED','项目与额度','按项目归集，按月份安排报销。') + `<div class="settings-grid"><section class="panel"><div class="panel-header"><div><h2>项目</h2><p>给相关的发票一个共同归属</p></div><button class="btn small" data-action="new-project">＋ 新建</button></div>${state.projects.length?`<div class="simple-list">${state.projects.map(p=>`<div class="project-item"><div class="quota-head"><h3>${esc(p.name)}</h3><span class="project-count">${state.invoices.filter(i=>i.project_id===p.id).length} 张发票</span></div>${p.note?`<p>${esc(p.note)}</p>`:''}</div>`).join('')}</div>`:empty('项目，让发票更有条理','差旅、日常办公、客户项目，都可以单独归集。','<button class="btn" data-action="new-project">新建第一个项目</button>','⊞')}</section><section class="panel"><div class="panel-header"><div><h2>月度报销额度</h2><p>创建草稿时选择额度，即计入已用金额</p></div>${canManageQuota()?'<button class="btn small" data-action="new-quota">＋ 新建</button>':''}</div>${state.quotas.length?`<div class="simple-list">${state.quotas.map(q=>`<div class="quota-item"><div class="quota-head"><div><span class="number">${esc(q.month)}</span> <span class="tag">${esc(q.category)}</span></div><strong>¥ ${fmt(q.amount_cents)}</strong></div><div class="progress-track" role="progressbar" aria-label="${esc(q.month)} ${esc(q.category)}额度使用情况" aria-valuemin="0" aria-valuemax="${q.amount_cents}" aria-valuenow="${q.used_cents}"><div class="progress-fill" style="width:${Math.min(100,Math.max(0,q.amount_cents?q.used_cents/q.amount_cents*100:0))}%"></div></div><div class="quota-bottom"><span>已用 ¥${fmt(q.used_cents)} · 剩余 ¥${fmt(q.remaining_cents)}</span>${canManageQuota() && !state.batches.some(b=>b.quota_id===q.id)?`<button class="link-button" data-action="delete-quota" data-id="${esc(q.id)}">删除</button>`:''}</div></div>`).join('')}</div><div class="panel-body"><p class="hint">只有关联该额度的报销单才计入使用；草稿、已提交和已报销均占用额度，撤销或退回后释放。月份为报销月份。</p></div>`:empty('给这个月留一笔额度','按类别设置月度上限，选择发票时心里更有数。',canManageQuota()?'<button class="btn" data-action="new-quota">设置月度额度</button>':'','◷')}</section></div>`;
+  const projects=state.projects.filter(p=>matchesGroup(p,settingsGroupFilter));
+  const quotas=state.quotas.filter(q=>matchesGroup(q,settingsGroupFilter));
+  return heading('KEEP IT ORGANIZED','项目与额度','按项目归集，按月份安排报销。') + `<div class="page-filters"><label class="field"><span>项目与额度归属</span><select data-view-group="settings">${groupOptions(settingsGroupFilter,{all:true})}</select></label></div><div class="settings-grid"><section class="panel"><div class="panel-header"><div><h2>项目</h2><p>给相关的发票一个共同归属</p></div><button class="btn small" data-action="new-project">＋ 新建</button></div>${projects.length?`<div class="simple-list">${projects.map(p=>`<div class="project-item"><div class="quota-head"><h3>${esc(p.name)}</h3><span class="tag">${esc(groupName(p.group_id))}</span><span class="project-count">${state.invoices.filter(i=>i.project_id===p.id).length} 张发票</span></div>${p.note?`<p>${esc(p.note)}</p>`:''}</div>`).join('')}</div>`:empty('项目，让发票更有条理','差旅、日常办公、客户项目，都可以单独归集。','<button class="btn" data-action="new-project">新建第一个项目</button>','⊞')}</section><section class="panel"><div class="panel-header"><div><h2>月度报销额度</h2><p>创建草稿时选择额度，即计入已用金额</p></div><button class="btn small" data-action="new-quota">＋ 新建</button></div>${quotas.length?`<div class="simple-list">${quotas.map(q=>`<div class="quota-item"><div class="quota-head"><div><span class="number">${esc(q.month)}</span> <span class="tag">${esc(groupName(q.group_id))}</span> <span class="tag">${esc(q.category)}</span></div><strong>¥ ${fmt(q.amount_cents)}</strong></div><div class="progress-track" role="progressbar" aria-label="${esc(q.month)} ${esc(q.category)}额度使用情况" aria-valuemin="0" aria-valuemax="${q.amount_cents}" aria-valuenow="${q.used_cents}"><div class="progress-fill" style="width:${Math.min(100,Math.max(0,q.amount_cents?q.used_cents/q.amount_cents*100:0))}%"></div></div><div class="quota-bottom"><span>已用 ¥${fmt(q.used_cents)} · 剩余 ¥${fmt(q.remaining_cents)}</span>${canManageQuota(q.group_id) && !state.batches.some(b=>b.quota_id===q.id)?`<button class="link-button" data-action="delete-quota" data-id="${esc(q.id)}">删除</button>`:''}</div></div>`).join('')}</div><div class="panel-body"><p class="hint">只有关联该额度的报销单才计入使用；草稿、已提交和已报销均占用额度，撤销或退回后释放。月份为报销月份。</p></div>`:empty('给这个月留一笔额度','按类别设置月度上限，选择发票时心里更有数。','<button class="btn" data-action="new-quota">设置月度额度</button>','◷')}</section></div>`;
 }
 function renderAccount() {
   return heading('YOUR ACCOUNT','账号设置','管理你的个人资料和登录密码。') + `<div class="settings-grid"><section class="panel"><div class="panel-header"><h2>个人资料</h2></div><form data-form="profile" class="panel-body form-stack"><label class="field"><span>用户名</span><input name="name" value="${esc(currentUser.name)}" autocomplete="nickname" maxlength="80" required><small>支持中文，仅用于显示，不用于登录。</small></label><label class="field"><span>登录邮箱</span><input name="email" type="email" value="${esc(currentUser.email)}" autocomplete="email" maxlength="254" required></label><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" maxlength="128" required></label><p class="hint">修改邮箱后，请使用新邮箱登录，其他设备需要重新登录。收票地址与已绑定的收件箱保持原有归属。</p><div class="inline-error" data-error role="alert"></div><button class="btn primary" type="submit">保存资料</button></form></section><section class="panel"><div class="panel-header"><h2>修改密码</h2></div><form data-form="password" class="panel-body form-stack"><label class="field"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" maxlength="128" required></label><label class="field"><span>新密码</span><input name="new_password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required><small>10 至 128 个字符</small></label><label class="field"><span>确认新密码</span><input name="confirm_password" type="password" autocomplete="new-password" minlength="10" maxlength="128" required></label><p class="hint">修改成功后，当前设备保持登录，其他设备需要重新登录。</p><div class="inline-error" data-error role="alert"></div><button class="btn primary" type="submit">修改密码</button></form></section></div>`;
 }
 function renderData() {
-  return heading('YOUR DATA, WITH YOU','数据管理','导出当前空间的发票账目，保存一份完整记录。') + `<div class="data-grid"><section class="data-card"><div class="data-icon" aria-hidden="true">▦</div><h2>导出票库台账</h2><p>将${activeGroupId?'当前群组共享':'个人'}发票的信息、金额、类别与报销状态导出为 Excel，方便查阅和进一步整理。</p><button class="btn primary" data-action="download" data-url="/api/export" data-filename="发票台账.xlsx">导出 Excel <span aria-hidden="true">↓</span></button><span class="file-type">.XLSX</span></section><section class="data-card"><div class="data-icon" aria-hidden="true">▣</div><h2>个人数据备份</h2><p>${activeGroupId?'完整备份仅在个人空间提供。切换到个人空间后，可以下载你自己的发票信息与原件。':'打包你自己的发票信息与原件，不包含其他用户的私人数据。建议定期备份到你信任的位置。'}</p>${activeGroupId?'<button class="btn" data-action="personal-space">切换到个人空间</button>':'<button class="btn" data-action="download" data-url="/api/backup" data-filename="票栈备份.zip">下载个人备份 <span aria-hidden="true">↓</span></button><span class="file-type">.ZIP</span>'}</section></div><div class="data-note"><strong>${activeGroupId?'当前群组':'你的个人空间'}</strong><br>共有 ${state.invoices.length} 张发票、${state.batches.length} 张报销单。个人发票仅本人可见；分享后的发票会对指定群组成员开放。${state.capabilities.ocr?'':' 图片和扫描件导入后需要手动补充信息。'}</div>`;
+  return heading('YOUR DATA, WITH YOU','数据管理','导出发票账目，保存一份完整记录。') + `<div class="data-grid"><section class="data-card"><div class="data-icon" aria-hidden="true">▦</div><h2>导出票库台账</h2><p>导出全部可见发票的信息、金额、类别与报销状态。</p><button class="btn primary" data-action="download" data-url="/api/export?unified=true" data-filename="发票台账.xlsx">导出 Excel ↓</button><span class="file-type">.XLSX</span></section><section class="data-card"><div class="data-icon" aria-hidden="true">▣</div><h2>个人数据备份</h2><p>打包你自己的发票信息与原件，不包含其他用户的私人数据。</p><button class="btn" data-action="download" data-url="/api/backup" data-filename="票栈备份.zip">下载个人备份 ↓</button><span class="file-type">.ZIP</span></section></div><div class="data-note">共有 ${state.invoices.length} 张可见发票、${state.batches.length} 张报销单。个人发票仅本人可见，分享后的发票向指定群组成员开放。</div>`;
 }
 function openModal(title,subtitle,content,footer = '',formName = '',formData = '') {
   cleanupOriginalViewers(modal);
@@ -203,7 +209,7 @@ function invoiceModal(id) {
   const locked = i.id && (i.status !== 'available' || i.can_edit === false);
   const owned = !i.owner_id || i.owner_id === currentUser?.id;
   const disabled = locked?'disabled':'';
-  const fields = `<div class="form-grid"><label class="field wide"><span>销售方</span><input name="seller" value="${esc(i.seller)}" placeholder="票面销售方名称" maxlength="200" ${disabled}></label><label class="field wide"><span>购买方 / 发票抬头</span><input name="buyer" value="${esc(i.buyer)}" placeholder="票面购买方名称" maxlength="200" ${disabled}></label><label class="field"><span>发票号码</span><input name="number" value="${esc(i.number)}" placeholder="保留完整号码" maxlength="100" ${disabled}></label><label class="field"><span>开票日期</span><input type="date" name="date" value="${esc(i.date)}" ${disabled}></label><label class="field"><span>价税合计（元）</span><input name="amount" value="${i.amount_cents?(i.amount_cents/100).toFixed(2):''}" inputmode="decimal" placeholder="0.00" ${disabled}></label><label class="field"><span>类别</span><select name="category" ${disabled}>${categories.map(c=>`<option ${c===i.category?'selected':''}>${c}</option>`).join('')}</select></label><label class="field wide"><span>所属项目</span><select name="project_id" ${disabled}>${projectOptions(i.project_id,'未分配项目')}</select></label><label class="field wide"><span>备注</span><textarea name="note" maxlength="1000" placeholder="用途、行程或其他说明" ${disabled}>${esc(i.note)}</textarea></label></div>`;
+  const fields = `<div class="form-grid">${!i.id?`<label class="field wide"><span>发票归属</span><select name="group_id" data-destination>${groupOptions()}</select></label>`:''}<label class="field wide"><span>销售方</span><input name="seller" value="${esc(i.seller)}" placeholder="票面销售方名称" maxlength="200" ${disabled}></label><label class="field wide"><span>购买方 / 发票抬头</span><input name="buyer" value="${esc(i.buyer)}" placeholder="票面购买方名称" maxlength="200" ${disabled}></label><label class="field"><span>发票号码</span><input name="number" value="${esc(i.number)}" placeholder="保留完整号码" maxlength="100" ${disabled}></label><label class="field"><span>开票日期</span><input type="date" name="date" value="${esc(i.date)}" ${disabled}></label><label class="field"><span>价税合计（元）</span><input name="amount" value="${i.amount_cents?(i.amount_cents/100).toFixed(2):''}" inputmode="decimal" placeholder="0.00" ${disabled}></label><label class="field"><span>类别</span><select name="category" ${disabled}>${categories.map(c=>`<option ${c===i.category?'selected':''}>${c}</option>`).join('')}</select></label><label class="field wide"><span>所属项目</span><select name="project_id" ${disabled}>${projectOptions(i.project_id,'未分配项目',i.id?'*':'')}</select></label><label class="field wide"><span>备注</span><textarea name="note" maxlength="1000" placeholder="用途、行程或其他说明" ${disabled}>${esc(i.note)}</textarea></label></div>`;
   const original = i.file_url?`<section class="invoice-original"><div class="original-link"><span>${esc(i.file_name || '发票原件')}</span>${originalActions(i,'','放大预览')}</div>${originalViewerMarkup(i.file_url,i.file_name)}</section>`:'';
   const review = i.review_note && !i.verified?`<p class="hint warn" style="margin-bottom:20px">${esc(i.review_note)}</p>`:'';
   const lockedNote = locked?`<p class="hint" style="margin-bottom:20px">${i.owner_id && !owned?'这张发票由 '+esc(i.owner_name || '群组成员')+' 分享，票面信息由上传者维护。':'这张发票已被报销单占用，当前仅可查看。'}</p>`:'';
@@ -212,13 +218,16 @@ function invoiceModal(id) {
   const viewer = $('[data-original-viewer]',modal);
   if (viewer) loadOriginalViewer(viewer);
 }
-function batchModal(invoiceIds,quotaId = '') {
+function batchModal(invoiceIds,quotaId = '',groupId = '') {
   const invoices = state.invoices.filter(i=>invoiceIds.includes(i.id));
   if (!invoices.length) {toast('请先选择发票。');return;}
   const sharedProject = invoices.every(i=>i.project_id===invoices[0].project_id)?invoices[0].project_id:'';
   const quota = state.quotas.find(q=>q.id===quotaId);
+  const destinations=(state.groups || []).filter(g=>invoices.every(i=>i.groups?.some(shared=>shared.id===g.id)));
+  groupId=quota?.group_id || groupId;
+  if(groupId && !destinations.some(g=>g.id===groupId)){toast('所选发票并未全部分享至该群组。');return;}
   const total = invoices.reduce((sum,i)=>sum+i.amount_cents,0);
-  const content = `<p class="import-summary">${invoices.length} 张发票 · 合计 ¥ ${fmt(total)}</p><div class="form-stack"><label class="field"><span>报销单名称</span><input name="name" value="${esc(localDate()+' 报销')}" maxlength="100" required></label><div class="form-grid"><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(sharedProject,'未分配项目')}</select></label><label class="field"><span>报销月份</span><input type="month" name="month" value="${esc(quota?.month || currentMonth())}" required></label></div><label class="field"><span>关联月度额度</span><select name="quota_id">${quotaOptions(quotaId)}</select></label><p class="hint">创建草稿后，发票将被占用。选择额度后，草稿金额计入该月已用额度；月份与类别需符合所选额度。</p><details><summary class="link-button">查看 ${invoices.length} 张发票</summary><div class="mini-list">${invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name)}<div class="minor">${esc(i.date)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div></details></div>`;
+  const content = `<p class="import-summary">${invoices.length} 张发票 · 合计 ¥ ${fmt(total)}</p><div class="form-stack"><label class="field"><span>报销归属</span><select name="group_id" data-destination>${groupOptions(groupId,{groups:destinations})}</select><small>群组报销单会向该组成员展示，所选发票须全部已分享至该组。</small></label><label class="field"><span>报销单名称</span><input name="name" value="${esc(localDate()+' 报销')}" maxlength="100" required></label><div class="form-grid"><label class="field"><span>所属项目</span><select name="project_id">${projectOptions(sharedProject,'未分配项目',groupId)}</select></label><label class="field"><span>报销月份</span><input type="month" name="month" value="${esc(quota?.month || currentMonth())}" required></label></div><label class="field"><span>关联月度额度</span><select name="quota_id">${quotaOptions(quotaId,groupId)}</select></label><p class="hint">创建草稿后，发票将被占用。选择额度后，草稿金额计入该月已用额度；月份与类别需符合所选额度。</p><details><summary class="link-button">查看 ${invoices.length} 张发票</summary><div class="mini-list">${invoices.map(i=>`<div class="mini-item"><div>${esc(i.seller || i.file_name)}<div class="minor">${esc(i.date)}</div></div><span class="money">¥ ${fmt(i.amount_cents)}</span></div>`).join('')}</div></details></div>`;
   openModal('创建报销草稿','确认这组发票的归属与报销月份。',content,'<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">创建草稿</button>','batch',`data-ids="${esc(JSON.stringify(invoiceIds))}"`);
 }
 function originalActions(invoice, batchId = '', previewLabel = '预览') {
@@ -299,7 +308,7 @@ function batchDetail(id) {
   const quota = state.quotas.find(q=>q.id===b.quota_id);
   const items = b.items?.length?b.items:state.invoices.filter(i=>(b.invoice_ids || []).includes(i.id));
   const files = items.filter(i=>i.file_url);
-  openModal(esc(b.name),`<span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span>`, `<div class="batch-total">¥ ${fmt(b.total_cents)}</div><dl class="detail-grid"><div><dt>所属项目</dt><dd>${esc(projectName(b.project_id))}</dd></div><div><dt>报销月份</dt><dd>${esc(b.month)}</dd></div><div><dt>月度额度</dt><dd>${quota?esc(quota.month+' · '+quota.category):'未关联额度'}</dd></div><div><dt>发票数量</dt><dd>${items.length} 张</dd></div></dl>${files.length?`<section class="batch-download-options"><div class="batch-download-heading"><label class="check-label"><input type="checkbox" data-rename-originals><span>下载时重命名原件</span></label><button type="button" class="btn small" data-action="download" data-batch-export="true" data-originals-only="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">批量下载原件（${files.length}）</button></div><p class="hint">勾选后按「序号-类别-金额」命名，可逐张修改。未勾选时保留原文件名；重名文件自动加后缀。</p></section>`:''}<div class="mini-list batch-invoices">${items.map((i,index)=>`<div class="mini-item batch-invoice"><div class="batch-invoice-info">${esc(i.seller || i.file_name || '发票')}<div class="minor">${esc(i.date)} · ${esc(i.category)} · ${esc(i.number || '未填写号码')}</div>${i.file_url?`<label class="rename-field" data-rename-field hidden><span>下载文件名</span><div><input data-export-name="${esc(i.id)}" aria-label="第 ${index+1} 张原件的下载文件名" value="${esc(String(index+1).padStart(3,'0')+'-'+i.category+'-'+(i.amount_cents/100).toFixed(2))}" required maxlength="100" disabled><span>.${esc((i.original_file_name || i.file_name).split('.').pop())}</span></div></label>`:''}</div><div class="batch-invoice-actions"><span class="money">¥ ${fmt(i.amount_cents)}</span>${originalActions(i,b.id)}</div></div>`).join('')}</div>`,`${b.can_manage!==false && b.status==='draft'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="cancelled">撤销草稿</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="rejected">标记退回</button>`:''}<button type="button" class="btn" data-action="download" data-batch-export="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">导出报销包</button><button type="button" class="btn primary" data-action="close-modal">完成</button>`);
+  openModal(esc(b.name),`<span class="badge ${esc(b.status)}">${esc(batchNames[b.status])}</span>`, `<div class="batch-total">¥ ${fmt(b.total_cents)}</div><dl class="detail-grid"><div><dt>报销归属</dt><dd>${esc(groupName(b.group_id))}</dd></div><div><dt>所属项目</dt><dd>${esc(projectName(b.project_id))}</dd></div><div><dt>报销月份</dt><dd>${esc(b.month)}</dd></div><div><dt>月度额度</dt><dd>${quota?esc(quota.month+' · '+quota.category):'未关联额度'}</dd></div><div><dt>发票数量</dt><dd>${items.length} 张</dd></div></dl>${files.length?`<section class="batch-download-options"><div class="batch-download-heading"><label class="check-label"><input type="checkbox" data-rename-originals><span>下载时重命名原件</span></label><button type="button" class="btn small" data-action="download" data-batch-export="true" data-originals-only="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">批量下载原件（${files.length}）</button></div><p class="hint">勾选后按「序号-类别-金额」命名，可逐张修改。未勾选时保留原文件名；重名文件自动加后缀。</p></section>`:''}<div class="mini-list batch-invoices">${items.map((i,index)=>`<div class="mini-item batch-invoice"><div class="batch-invoice-info">${esc(i.seller || i.file_name || '发票')}<div class="minor">${esc(i.date)} · ${esc(i.category)} · ${esc(i.number || '未填写号码')}</div>${i.file_url?`<label class="rename-field" data-rename-field hidden><span>下载文件名</span><div><input data-export-name="${esc(i.id)}" aria-label="第 ${index+1} 张原件的下载文件名" value="${esc(String(index+1).padStart(3,'0')+'-'+i.category+'-'+(i.amount_cents/100).toFixed(2))}" required maxlength="100" disabled><span>.${esc((i.original_file_name || i.file_name).split('.').pop())}</span></div></label>`:''}</div><div class="batch-invoice-actions"><span class="money">¥ ${fmt(i.amount_cents)}</span>${originalActions(i,b.id)}</div></div>`).join('')}</div>`,`${b.can_manage!==false && b.status==='draft'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="cancelled">撤销草稿</button>`:''}${b.can_manage!==false && b.status==='submitted'?`<button type="button" class="btn danger left" data-action="batch-status" data-id="${esc(b.id)}" data-status="rejected">标记退回</button>`:''}<button type="button" class="btn" data-action="download" data-batch-export="true" data-url="/api/batches/${encodeURIComponent(b.id)}/export">导出报销包</button><button type="button" class="btn primary" data-action="close-modal">完成</button>`);
 }
 
 async function importFiles(files) {
@@ -310,11 +319,12 @@ async function importFiles(files) {
   try {
     const body = new FormData();
     for (const file of files) body.append('files',file);
-    const result = await api('/api/import',{method:'POST',body});
+    const destination=importGroup;
+    const result = await api('/api/import'+(destination?'?group_id='+encodeURIComponent(destination):''),{method:'POST',body});
     await refresh();
     const imported = result.imported || [], duplicates = result.duplicates || [], errors = result.errors || [];
     modalBusy = false;
-    openModal('导入完成',activeGroupId?'原件已保存，并分享至当前群组。':'原件已保存到你的个人票栈。',`<p class="import-summary">已导入 ${imported.length} 张 · 跳过重复 ${duplicates.length} 个 · 失败 ${errors.length} 个</p>${imported.length?'<p class="hint">导入的发票需要核对票面信息，确认后才会参与金额匹配。</p>':''}${duplicates.length?`<h3 class="spaced">重复文件</h3><ul class="import-list">${duplicates.map(name=>`<li>${esc(typeof name==='string'?name:name.filename)}</li>`).join('')}</ul>`:''}${errors.length?`<h3 class="spaced">未导入的文件</h3><ul class="import-list">${errors.map(error=>`<li>${esc(error.filename)}：${esc(error.error)}</li>`).join('')}</ul>`:''}`,`${imported.length?'<button class="btn primary" data-action="review-imported">去核对发票</button>':'<button class="btn primary" data-action="close-modal">完成</button>'}`);
+    openModal('导入完成','原件已保存到票库。',`<p class="import-summary">已导入 ${imported.length} 张 · 跳过重复 ${duplicates.length} 个 · 失败 ${errors.length} 个</p>${imported.length?'<p class="hint">导入的发票需要核对票面信息，确认后才会参与金额匹配。</p>':''}${duplicates.length?`<h3 class="spaced">重复文件</h3><ul class="import-list">${duplicates.map(name=>`<li>${esc(typeof name==='string'?name:name.filename)}</li>`).join('')}</ul>`:''}${errors.length?`<h3 class="spaced">未导入的文件</h3><ul class="import-list">${errors.map(error=>`<li>${esc(error.filename)}：${esc(error.error)}</li>`).join('')}</ul>`:''}`,`${imported.length?'<button class="btn primary" data-action="review-imported">去核对发票</button>':'<button class="btn primary" data-action="close-modal">完成</button>'}`);
   } catch (error) {
     modalBusy = false;
     openModal('导入未完成','请检查文件后重试。',`<p class="inline-error">${esc(error.message)}</p>`,'<button class="btn primary" data-action="close-modal">知道了</button>');
@@ -341,7 +351,7 @@ async function download(button) {
   button.disabled = true;
   button.textContent = '正在准备…';
   try {
-    const response = await fetch(scopedURL(path),options);
+    const response = await fetch(path,options);
     if (!response.ok) {
       const error = await response.json().catch(()=>({}));
       throw new Error(typeof error.detail==='string'?error.detail:'导出失败，请重试。');
@@ -382,19 +392,19 @@ document.addEventListener('click',async event=>{
   if(action==='toggle-filters'){
     const details=$('#extra-filters');details.hidden=!details.hidden;button.setAttribute('aria-expanded',String(!details.hidden));return;
   }
-  if(action==='clear-filters'){filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};renderPage();return;}
+  if(action==='clear-filters'){filters={group_id:'',q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};renderPage();return;}
   if(action==='clear-selection'){selected.clear();updateInvoiceTable();return;}
   if(action==='create-selected'){batchModal([...selected]);return;}
-  if(action==='use-combination'){batchModal(matchData.combinations[Number(button.dataset.index)].invoice_ids,matchValues.quota_id);return;}
+  if(action==='use-combination'){batchModal(matchData.combinations[Number(button.dataset.index)].invoice_ids,matchValues.quota_id,matchData.group_id || '');return;}
   if(action==='batch-filter'){batchFilter=button.dataset.value;renderPage();return;}
   if(action==='batch-detail'){batchDetail(id);return;}
   if(action==='download'){await download(button);return;}
   if(action==='review-imported'){closeModal();filters.status='review';if(activePage==='invoices')renderPage();else location.hash='invoices';return;}
   if(action==='new-project'){
-    openModal('新建项目','按用途归集相关发票。','<div class="form-stack"><label class="field"><span>项目名称</span><input name="name" placeholder="例如：上海差旅" maxlength="100" required></label><label class="field"><span>备注（选填）</span><textarea name="note" maxlength="1000" placeholder="补充说明"></textarea></label></div>','<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">创建项目</button>','project');return;
+    openModal('新建项目','按用途归集相关发票。',`<div class="form-stack"><label class="field"><span>项目归属</span><select name="group_id">${groupOptions()}</select></label><label class="field"><span>项目名称</span><input name="name" placeholder="例如：上海差旅" maxlength="100" required></label><label class="field"><span>备注（选填）</span><textarea name="note" maxlength="1000" placeholder="补充说明"></textarea></label></div>`,`<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">创建项目</button>`,'project');return;
   }
   if(action==='new-quota'){
-    openModal('设置月度额度','为一个月份与类别设置报销上限。',`<div class="form-stack"><label class="field"><span>报销月份</span><input name="month" type="month" value="${currentMonth()}" required></label><label class="field"><span>适用类别</span><select name="category"><option>全部</option>${categories.map(c=>`<option>${c}</option>`).join('')}</select></label><label class="field"><span>额度（元）</span><input name="amount" inputmode="decimal" placeholder="0.00" required></label><p class="hint">额度只统计创建报销草稿时主动关联它的报销单。</p></div>`,'<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">保存额度</button>','quota');return;
+    openModal('设置月度额度','为一个月份与类别设置报销上限。',`<div class="form-stack"><label class="field"><span>额度归属</span><select name="group_id">${groupOptions('',{admin:true})}</select></label><label class="field"><span>报销月份</span><input name="month" type="month" value="${currentMonth()}" required></label><label class="field"><span>适用类别</span><select name="category"><option>全部</option>${categories.map(c=>`<option>${c}</option>`).join('')}</select></label><label class="field"><span>额度（元）</span><input name="amount" inputmode="decimal" placeholder="0.00" required></label><p class="hint">额度只统计创建报销草稿时主动关联它的报销单。</p></div>`,'<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">保存额度</button>','quota');return;
   }
   if(action==='delete-invoice'){
     if(!confirm('删除这张发票及其原件？此操作无法撤销。'))return;
@@ -420,6 +430,19 @@ document.addEventListener('change',event=>{
   if(el.dataset.filter){filters[el.dataset.filter]=el.value;updateInvoiceTable();}
   if(el.dataset.select){if(el.checked)selected.add(el.dataset.select);else selected.delete(el.dataset.select);updateSelection();const all=$('#select-all');if(all){const eligible=visibleInvoices().filter(i=>i.verified&&i.status==='available');all.checked=eligible.length>0&&eligible.every(i=>selected.has(i.id));all.indeterminate=eligible.some(i=>selected.has(i.id))&&!all.checked;}}
   if(el.id==='select-all'){visibleInvoices().filter(i=>i.verified&&i.status==='available').forEach(i=>el.checked?selected.add(i.id):selected.delete(i.id));updateInvoiceTable();}
+  if(el.id==='import-group')importGroup=el.value;
+  if(el.dataset.viewGroup){
+    const view=el.dataset.viewGroup;
+    if(view==='batches')batchGroupFilter=el.value;
+    else if(view==='mailboxes')mailboxGroupFilter=el.value;
+    else settingsGroupFilter=el.value;
+    renderPage();$(`[data-view-group="${view}"]`)?.focus();
+  }
+  if(el.matches('[data-destination]')){
+    const form=el.closest('form');
+    if(form.elements.project_id)form.elements.project_id.innerHTML=projectOptions('','未分配项目',el.value);
+    if(form.elements.quota_id)form.elements.quota_id.innerHTML=quotaOptions('',el.value);
+  }
   if(el.id==='file-input')importFiles([...el.files]);
 });
 document.addEventListener('submit',async event=>{
@@ -439,7 +462,7 @@ document.addEventListener('submit',async event=>{
   try {
     if(form.dataset.form==='invoice'){
       const id=form.dataset.id;
-      const payload={number:data.number.trim(),seller:data.seller.trim(),buyer:data.buyer.trim(),date:data.date,category:data.category,project_id:data.project_id || null,note:data.note.trim(),amount_cents:data.amount?cents(data.amount):0,verified:true};
+      const payload={group_id:data.group_id || null,number:data.number.trim(),seller:data.seller.trim(),buyer:data.buyer.trim(),date:data.date,category:data.category,project_id:data.project_id || null,note:data.note.trim(),amount_cents:data.amount?cents(data.amount):0,verified:true};
       if(!payload.seller||!payload.date||payload.amount_cents<=0)throw new Error('确认核对前，请补全销售方、开票日期和大于零的金额。');
       await api(id?`/api/invoices/${encodeURIComponent(id)}`:'/api/invoices',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
       modal.close();await refresh();matchData=null;toast('发票已确认核对。');
@@ -449,19 +472,21 @@ document.addEventListener('submit',async event=>{
       const target=cents(data.target);
       if(target<=0||target>10000000)throw new Error('目标金额需大于 0 且不超过 100,000 元。');
       if(data.date_from&&data.date_to&&data.date_from>data.date_to)throw new Error('开始日期不能晚于结束日期。');
-      const payload={target_cents:target,direction:data.direction};
+      const payload={target_cents:target,direction:data.direction,unified:true};
+      if(['personal','owned'].includes(data.source))payload.source=data.source;
+      else if(data.source)payload.group_id=data.source;
       ['category','project_id','date_from','date_to','buyer','quota_id'].forEach(key=>{if(data[key])payload[key]=data[key];});
       $('#match-results').innerHTML='<div class="panel loading-state"><span class="spinner"></span><p>正在寻找合适的发票组合…</p></div>';
-      const requestedScope=activeGroupId;
+      const requestedUser=currentUser?.id;
       const matchResponse=await api('/api/match',{method:'POST',body:JSON.stringify(payload)});
-      if(requestedScope===activeGroupId){matchData=matchResponse;if ($('#match-results')) $('#match-results').innerHTML=renderMatchResults();}
+      if(requestedUser===currentUser?.id){matchData=matchResponse;if ($('#match-results')) $('#match-results').innerHTML=renderMatchResults();}
     }else if(form.dataset.form==='batch'){
-      await api('/api/batches',{method:'POST',body:JSON.stringify({name:data.name.trim(),invoice_ids:JSON.parse(form.dataset.ids),project_id:data.project_id || null,quota_id:data.quota_id || null,month:data.month})});
+      await api('/api/batches',{method:'POST',body:JSON.stringify({unified:true,group_id:data.group_id || null,name:data.name.trim(),invoice_ids:JSON.parse(form.dataset.ids),project_id:data.project_id || null,quota_id:data.quota_id || null,month:data.month})});
       selected.clear();matchData=null;modal.close();await refresh({render:false});location.hash='batches';if(activePage==='batches')renderPage();toast('报销草稿已创建。');
     }else if(form.dataset.form==='project'){
-      await api('/api/projects',{method:'POST',body:JSON.stringify({name:data.name.trim(),note:data.note.trim()})});modal.close();await refresh();toast('项目已创建。');
+      await api('/api/projects',{method:'POST',body:JSON.stringify({group_id:data.group_id || null,name:data.name.trim(),note:data.note.trim()})});modal.close();await refresh();toast('项目已创建。');
     }else if(form.dataset.form==='quota'){
-      await api('/api/quotas',{method:'POST',body:JSON.stringify({month:data.month,category:data.category,amount_cents:cents(data.amount)})});modal.close();await refresh();toast('额度已保存。');
+      await api('/api/quotas',{method:'POST',body:JSON.stringify({group_id:data.group_id || null,month:data.month,category:data.category,amount_cents:cents(data.amount)})});modal.close();await refresh();toast('额度已保存。');
     }
   }catch(error){errorBox.textContent=error.message;if(form.dataset.form==='invoice')errorBox.scrollIntoView({block:'nearest'});if(form.dataset.form==='match' && $('#match-results'))$('#match-results').innerHTML=renderMatchResults();}
   finally{button.disabled=false;button.textContent=originalText;modalBusy=false;}
@@ -474,16 +499,12 @@ document.addEventListener('drop',event=>{const zone=event.target.closest('#drop-
 window.addEventListener('hashchange',navigate);
 $('#today').textContent=new Intl.DateTimeFormat('zh-CN',{year:'numeric',month:'long',day:'numeric',weekday:'short'}).format(new Date());
 
-function currentGroup() { return (state.groups || []).find(g=>g.id===activeGroupId); }
-function canManageQuota() { return !activeGroupId || ['owner','admin'].includes(currentGroup()?.role); }
+function canManageQuota(groupId = '') { return !groupId || (state.groups || []).some(g=>g.id===groupId && ['owner','admin'].includes(g.role)); }
 function roleName(role) { return {owner:'群主',admin:'管理员',member:'成员'}[role] || role; }
 function updateWorkspaceChrome() {
   document.body.classList.remove('auth-mode');
-  const select=$('#space-select');
-  select.innerHTML=`<option value="">个人空间</option>${(state.groups || []).map(g=>`<option value="${esc(g.id)}" ${activeGroupId===g.id?'selected':''}>${esc(g.name)}</option>`).join('')}`;
-  select.value=activeGroupId;
-  $('#workspace-name').textContent=currentGroup()?.name || '个人空间';
-  pageNames.invoices=activeGroupId?'群组票库':'我的票库';
+  $('#workspace-name').textContent='票栈';
+  pageNames.invoices='票库';
   $('#invoice-nav-label').textContent=pageNames.invoices;
   $('#account-name').textContent=currentUser?.name || '我的账号';
   $('#account-email').textContent=currentUser?.email || '';
@@ -499,39 +520,20 @@ function renderAuth() {
 async function bootstrap() {
   try {
     const session=await api('/api/auth/status');
-    if(currentUser?.id !== session.user?.id)resetReceiptAddresses();
+    if(currentUser?.id !== session.user?.id){resetReceiptAddresses();mailboxData=null;}
     currentUser=session.user;
     registrationOpen=!!session.registration_open;
     if (!currentUser) {renderAuth();return;}
-    try {await refresh({render:false});} catch(error) {
-      if(!activeGroupId)throw error;
-      activeGroupId='';localStorage.removeItem('invoice.activeGroup');await refresh({render:false});
-    }
+    await refresh({render:false});
     navigate();
   } catch(error) {
     $('#main').innerHTML=`${heading('YOUR WORKSPACE','暂时无法打开票栈','请确认服务仍在运行，或稍后重试。')}<div class="panel">${empty('连接失败',esc(error.message),'<button class="btn primary" id="reload-app">重新连接</button>')}</div>`;
     $('#reload-app').addEventListener('click',()=>location.reload());
   }
 }
-async function switchGroup(groupId) {
-  if(scopeBusy)return;
-  scopeBusy=true;
-  const old=activeGroupId;
-  resetReceiptAddresses();
-  activeGroupId=groupId;
-  $('#space-select').disabled=true;
-  try {
-    await refresh({render:false});
-    localStorage.setItem('invoice.activeGroup',activeGroupId);
-    selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
-    filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
-    matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
-    renderPage();toast(`已切换到${currentGroup()?.name || '个人空间'}。`);
-  } catch(error) {activeGroupId=old;$('#space-select').value=old;toast(error.message);if(activePage==='mailboxes')loadReceiptAddresses();} finally {$('#space-select').disabled=false;scopeBusy=false;}
-}
 function renderGroups() {
   const groups=state.groups || [];
-  return heading('SHARE WITH YOUR TEAM','群组管理','发票默认仅自己可见，按需分享给一个或多个群组。','<button class="btn" data-action="join-group">加入群组</button><button class="btn primary" data-action="new-group">＋ 创建群组</button>')+`<div class="hint group-hint">分享后，群组成员可以查看原件并使用发票报销。票面信息由上传者维护，同一张发票在所有群组共用报销状态，避免重复使用。</div>${groups.length?`<div class="batch-grid">${groups.map(g=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(g.name)}</h3><p>${g.member_count || 1} 位成员</p></div><span class="badge ${g.role==='owner'?'available':''}">${esc(roleName(g.role))}</span></div><p class="batch-detail group-description">${esc(g.description || (g.id===activeGroupId?'当前所在的工作空间':'选择分享至本组的发票，组内协同报销。'))}</p><div class="batch-actions"><button class="btn primary small" data-action="open-group" data-id="${esc(g.id)}">进入票库</button><button class="btn small" data-action="group-settings" data-id="${esc(g.id)}">团队设置</button><button class="btn small" data-action="group-members" data-id="${esc(g.id)}">查看成员</button>${['owner','admin'].includes(g.role)?`<button class="btn small" data-action="invite-group" data-id="${esc(g.id)}">邀请成员</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('和团队一起整理发票','创建群组，或输入邀请码加入已有群组。你的个人发票不会自动对群组可见。','<button class="btn primary" data-action="new-group">创建第一个群组</button><button class="btn ghost" data-action="join-group">使用邀请码</button>','♧')}</div>`}`;
+  return heading('SHARE WITH YOUR TEAM','群组管理','发票默认仅自己可见，按需分享给一个或多个群组。','<button class="btn" data-action="join-group">加入群组</button><button class="btn primary" data-action="new-group">＋ 创建群组</button>')+`<div class="hint group-hint">分享后，群组成员可以查看原件并使用发票报销。票面信息由上传者维护，同一张发票在所有群组共用报销状态，避免重复使用。</div>${groups.length?`<div class="batch-grid">${groups.map(g=>`<article class="batch-card"><div class="card-top"><div><h3>${esc(g.name)}</h3><p>${g.member_count || 1} 位成员</p></div><span class="badge ${g.role==='owner'?'available':''}">${esc(roleName(g.role))}</span></div><p class="batch-detail group-description">${esc(g.description || '选择分享至本组的发票，组内协同报销。')}</p><div class="batch-actions"><button class="btn primary small" data-action="open-group" data-id="${esc(g.id)}">查看发票</button><button class="btn small" data-action="group-settings" data-id="${esc(g.id)}">团队设置</button><button class="btn small" data-action="group-members" data-id="${esc(g.id)}">查看成员</button>${['owner','admin'].includes(g.role)?`<button class="btn small" data-action="invite-group" data-id="${esc(g.id)}">邀请成员</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${empty('和团队一起整理发票','创建群组，或输入邀请码加入已有群组。你的个人发票不会自动对群组可见。','<button class="btn primary" data-action="new-group">创建第一个群组</button><button class="btn ghost" data-action="join-group">使用邀请码</button>','♧')}</div>`}`;
 }
 function groupSettings(groupId) {
   const group=(state.groups || []).find(g=>g.id===groupId);
@@ -555,10 +557,12 @@ function dissolveGroupModal(groupId) {
 }
 function resetDepartedGroup(groupId) {
   selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();
-  if(activeGroupId!==groupId)return;
-  activeGroupId='';localStorage.removeItem('invoice.activeGroup');
-  filters={q:'',category:'',status:'',project_id:'',date_from:'',date_to:'',min:'',max:''};
-  matchValues={target:'',direction:'above',category:'',project_id:'',date_from:'',date_to:'',buyer:'',quota_id:''};
+  if(filters.group_id===groupId)filters.group_id='';
+  if(matchValues.source===groupId)matchValues.source='';
+  if(importGroup===groupId)importGroup='';
+  if(batchGroupFilter===groupId)batchGroupFilter='';
+  if(settingsGroupFilter===groupId)settingsGroupFilter='';
+  if(mailboxGroupFilter===groupId)mailboxGroupFilter='';
 }
 async function showMembers(groupId) {
   const group=(state.groups || []).find(g=>g.id===groupId);
@@ -576,31 +580,31 @@ async function showShares(invoiceId) {
   openModal('发票分享','只向你选中的群组开放这张发票。',content,`<button type="button" class="btn" data-action="close-modal">取消</button>${groups.length?'<button class="btn primary" type="submit">保存分享设置</button>':''}`,'shares',`data-id="${esc(invoiceId)}"`);
 }
 function renderMailboxes() {
-  const manageable=canManageQuota();
-  const body=mailboxData===null?'<div class="panel loading-state"><span class="spinner"></span><p>正在读取邮箱配置…</p></div>':mailboxData.length?`<div class="batch-grid">${mailboxData.map(m=>`<article class="batch-card mailbox-card"><div class="card-top"><div><h3>${esc(m.name || m.address)}</h3><p>${esc(m.address)}</p></div><span class="badge ${m.enabled?'available':''}">${m.enabled?'自动收票':'已暂停'}</span></div><div class="mailbox-details"><div><span>收件文件夹</span><strong>${esc(m.folder || 'INBOX')}</strong></div><div><span>最近同步</span><strong>${m.last_sync?esc(formatTimestamp(m.last_sync)):'尚未同步'}</strong></div><div><span>票库归属</span><strong>${m.group_id?esc((state.groups || []).find(g=>g.id===m.group_id)?.name || '群组'):'个人空间'}</strong></div></div>${m.last_error?`<p class="inline-error mailbox-error">${esc(m.last_error)}</p>`:''}<div class="batch-actions">${manageable?`<button class="btn primary small" data-action="sync-mailbox" data-id="${esc(m.id)}">立即收票</button><button class="btn small" data-action="edit-mailbox" data-id="${esc(m.id)}">设置</button><button class="btn small" data-action="mailbox-results" data-id="${esc(m.id)}">收票记录</button>${m.last_error?`<button class="btn small" data-action="retry-mailbox" data-id="${esc(m.id)}">重试失败邮件</button>`:''}`:'<span class="text-muted">邮箱由群组管理员管理。</span>'}</div></article>`).join('')}</div>`:`<div class="panel">${empty('让新发票自己进票栈',manageable?'绑定收票邮箱，自动提取新邮件中的发票附件。首次绑定后只处理新到邮件。':'群组管理员可以配置一个专用邮箱，将新收到的发票分享至本组。',manageable?'<button class="btn primary" data-action="new-mailbox">绑定收票邮箱</button>':'','✉')}</div>`;
-  return heading('INVOICES, DELIVERED','邮箱收票','把收到的发票，自动归入当前票库。')+`<section id="receipt-addresses-section" class="receipt-addresses-section" aria-label="域名收票地址">${renderReceiptAddresses()}</section><section class="mailbox-method" aria-label="已有邮箱收票"><div class="mailbox-method-heading"><div><h2>已有邮箱收票</h2><p>绑定自己的收件箱，通过 IMAP 自动提取发票附件。</p></div>${manageable?'<button class="btn" data-action="new-mailbox">＋ 绑定邮箱</button>':''}</div><div class="hint group-hint">每 60 秒检查新邮件，仅提取发票附件，不会删除邮件。识别结果统一进入待核对状态。群组邮箱收到的发票会自动分享至对应群组。</div><div id="imap-mailboxes">${body}</div></section>`;
+  const mailboxes=(mailboxData || []).filter(m=>matchesGroup(m,mailboxGroupFilter));
+  const body=mailboxData===null?'<div class="panel loading-state"><span class="spinner"></span><p>正在读取邮箱配置…</p></div>':mailboxes.length?`<div class="batch-grid">${mailboxes.map(m=>`<article class="batch-card mailbox-card"><div class="card-top"><div><h3>${esc(m.name || m.address)}</h3><p>${esc(m.address)}</p></div><span class="badge ${m.enabled?'available':''}">${m.enabled?'自动收票':'已暂停'}</span></div><div class="mailbox-details"><div><span>收件文件夹</span><strong>${esc(m.folder || 'INBOX')}</strong></div><div><span>最近同步</span><strong>${m.last_sync?esc(formatTimestamp(m.last_sync)):'尚未同步'}</strong></div><div><span>发票归入</span><strong>${esc(groupName(m.group_id))}</strong></div></div>${m.last_error?`<p class="inline-error mailbox-error">${esc(m.last_error)}</p>`:''}<div class="batch-actions"><button class="btn primary small" data-action="sync-mailbox" data-id="${esc(m.id)}">立即收票</button><button class="btn small" data-action="edit-mailbox" data-id="${esc(m.id)}">编辑</button><button class="btn small" data-action="mailbox-results" data-id="${esc(m.id)}">收票记录</button>${m.last_error?`<button class="btn small" data-action="retry-mailbox" data-id="${esc(m.id)}">重试失败邮件</button>`:''}</div></article>`).join('')}</div>`:`<div class="panel">${mailboxData.length?empty('没有符合归属的邮箱','更换归属筛选，或绑定新的邮箱。','<button class="btn" data-action="clear-mailbox-filter">清除归属筛选</button>','✉'):empty('让新发票自己进票栈','绑定收票邮箱，自动提取新邮件中的发票附件。首次绑定后只处理新到邮件。','<button class="btn primary" data-action="new-mailbox">绑定收票邮箱</button>','✉')}</div>`;
+  return heading('INVOICES, DELIVERED','邮箱收票','管理自己的收票邮箱与发票归属。')+`<div class="page-filters"><label class="field"><span>发票归属</span><select data-view-group="mailboxes">${groupOptions(mailboxGroupFilter,{all:true})}</select></label></div><section id="receipt-addresses-section" class="receipt-addresses-section" aria-label="域名收票地址">${renderReceiptAddresses()}</section><section class="mailbox-method" aria-label="已有邮箱收票"><div class="mailbox-method-heading"><div><h2>已有邮箱收票</h2><p>绑定自己的收件箱，通过 IMAP 自动提取发票附件。</p></div><button class="btn" data-action="new-mailbox">＋ 绑定邮箱</button></div><div class="hint group-hint">每 60 秒检查新邮件，仅提取发票附件，不会删除邮件。邮箱配置和收票记录仅本人可见，发票按所选归属分享至群组。</div><div id="imap-mailboxes">${body}</div></section>`;
 }
 function formatTimestamp(value) {
   const parsed=new Date(value);
   return Number.isNaN(parsed.getTime())?value:new Intl.DateTimeFormat('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}).format(parsed);
 }
 async function loadMailboxes() {
-  if(mailboxLoading)return;
+  if(mailboxLoading || !currentUser)return;
   mailboxLoading=true;
-  const scope=activeGroupId;
+  const userId=currentUser.id;
   try {
     const data=await api('/api/mailboxes');
-    if(scope!==activeGroupId)return;
-    mailboxData=(data.mailboxes || []).filter(m=>(m.group_id || '')===activeGroupId);
+    if(userId!==currentUser?.id)return;
+    mailboxData=data.mailboxes || [];
     if(activePage==='mailboxes')$('#main').innerHTML=renderMailboxes();
   } catch(error) {
-    if(currentUser && scope===activeGroupId && activePage==='mailboxes' && $('#imap-mailboxes'))$('#imap-mailboxes').innerHTML=`<div class="panel">${empty('暂时无法读取邮箱配置',esc(error.message),'<button class="btn" data-action="reload-mailboxes">重试</button>','✉')}</div>`;
-  } finally {mailboxLoading=false;if(currentUser && scope!==activeGroupId && activePage==='mailboxes')loadMailboxes();}
+    if(userId===currentUser?.id && activePage==='mailboxes' && $('#imap-mailboxes'))$('#imap-mailboxes').innerHTML=`<div class="panel">${empty('暂时无法读取邮箱配置',esc(error.message),'<button class="btn" data-action="reload-mailboxes">重试</button>','✉')}</div>`;
+  } finally {mailboxLoading=false;if(currentUser && userId!==currentUser.id && activePage==='mailboxes')loadMailboxes();}
 }
 function mailboxModal(id) {
-  const m=(mailboxData || []).find(item=>item.id===id) || {name:'',address:'',host:'',port:993,username:'',folder:'INBOX',group_id:activeGroupId,enabled:true};
-  const destinations=(state.groups || []).filter(g=>['owner','admin'].includes(g.role));
-  openModal(id?'邮箱设置':'绑定收票邮箱','使用邮箱服务商提供的 IMAP 地址和邮箱授权码。',`<div class="form-grid"><label class="field"><span>邮箱名称</span><input name="name" value="${esc(m.name)}" placeholder="例如：工作收票邮箱" maxlength="100" required></label><label class="field"><span>邮箱地址</span><input name="address" value="${esc(m.address)}" type="email" placeholder="invoices@example.com" autocomplete="off" required></label><label class="field"><span>IMAP 服务器</span><input name="host" value="${esc(m.host)}" placeholder="imap.example.com" autocomplete="off" required><small>使用加密连接，端口 993。</small></label><label class="field"><span>登录用户名</span><input name="username" value="${esc(m.username)}" placeholder="通常与邮箱地址相同" autocomplete="off" required></label><label class="field wide"><span>邮箱授权码 / 应用专用密码</span><input name="password" type="password" autocomplete="new-password" placeholder="${id?'留空保留已保存的授权码':'从邮箱设置中获取授权码'}" ${id?'':'required'}><small>${id && m.has_password?'授权码已保存，不会回填。':'请先在邮箱设置中启用 IMAP，并生成专用授权码。'}</small></label><label class="field"><span>收件文件夹</span><input name="folder" value="${esc(m.folder || 'INBOX')}" placeholder="INBOX" required></label><label class="field"><span>发票保存至</span><select name="group_id" ${id?'disabled':''}><option value="">个人空间</option>${destinations.map(g=>`<option value="${esc(g.id)}" ${g.id===m.group_id?'selected':''}>${esc(g.name)}</option>`).join('')}</select></label><label class="check-label wide"><input type="checkbox" name="enabled" ${m.enabled?'checked':''}><span>启用自动收票，每 60 秒检查新邮件。</span></label><p class="hint wide">只处理绑定后新到的邮件，不回读历史邮件。${m.group_id?'发票将分享给所选群组的成员。':'邮件中的发票默认保存到你的个人票库。'}</p></div>`,`${id?`<button type="button" class="btn danger left" data-action="delete-mailbox" data-id="${esc(id)}">移除邮箱</button>`:''}<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">${id?'保存设置':'绑定邮箱'}</button>`,'mailbox',`data-id="${esc(id || '')}" data-group="${esc(m.group_id || '')}"`);
+  const m=(mailboxData || []).find(item=>item.id===id) || {name:'',address:'',host:'',port:993,username:'',folder:'INBOX',group_id:'',enabled:true};
+  const destinations=state.groups || [];
+  openModal(id?'邮箱设置':'绑定收票邮箱','使用邮箱服务商提供的 IMAP 地址和邮箱授权码。',`<div class="form-grid"><label class="field"><span>邮箱名称</span><input name="name" value="${esc(m.name)}" placeholder="例如：工作收票邮箱" maxlength="100" required></label><label class="field"><span>邮箱地址</span><input name="address" value="${esc(m.address)}" type="email" placeholder="invoices@example.com" autocomplete="off" required></label><label class="field"><span>IMAP 服务器</span><input name="host" value="${esc(m.host)}" placeholder="imap.example.com" autocomplete="off" required><small>使用加密连接，端口 993。</small></label><label class="field"><span>登录用户名</span><input name="username" value="${esc(m.username)}" placeholder="通常与邮箱地址相同" autocomplete="off" required></label><label class="field wide"><span>邮箱授权码 / 应用专用密码</span><input name="password" type="password" autocomplete="new-password" placeholder="${id?'留空保留已保存的授权码':'从邮箱设置中获取授权码'}" ${id?'':'required'}><small>${id && m.has_password?'授权码已保存，不会回填。':'请先在邮箱设置中启用 IMAP，并生成专用授权码。'}</small></label><label class="field"><span>收件文件夹</span><input name="folder" value="${esc(m.folder || 'INBOX')}" placeholder="INBOX" required></label><label class="field"><span>发票保存至</span><select name="group_id"><option value="">个人</option>${destinations.map(g=>`<option value="${esc(g.id)}" ${g.id===m.group_id?'selected':''}>${esc(g.name)}</option>`).join('')}</select></label><label class="check-label wide"><input type="checkbox" name="enabled" ${m.enabled?'checked':''}><span>启用自动收票，每 60 秒检查新邮件。</span></label><p class="hint wide">只处理绑定后新到的邮件，不回读历史邮件。发票归你所有，按所选归属分享至群组。${id?'修改归属后，下次收取的邮件使用新归属；已导入发票不变。':''}</p></div>`,`${id?`<button type="button" class="btn danger left" data-action="delete-mailbox" data-id="${esc(id)}">移除邮箱</button>`:''}<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">${id?'保存设置':'绑定邮箱'}</button>`,'mailbox',`data-id="${esc(id || '')}"`);
 }
 async function submitOnlineForm(form) {
   const button=$('button[type=submit]',form);
@@ -645,13 +649,14 @@ async function submitOnlineForm(form) {
     }else if(kind==='shares'){
       await api(`/api/invoices/${encodeURIComponent(form.dataset.id)}/shares`,{method:'PUT',body:JSON.stringify({group_ids:fields.getAll('group_ids')})});modal.close();await refresh();matchData=null;toast('发票分享设置已保存。');
     }else if(kind==='receipt-address'){
-      const payload={prefix:data.prefix.trim(),name:data.name.trim()};
-      if(activeGroupId)payload.group_id=activeGroupId;
-      await api('/api/receipt-addresses',{method:'POST',body:JSON.stringify(payload)});
-      modal.close();resetReceiptAddresses();await loadReceiptAddresses();toast('收票地址已创建，新发票将自动归入待核对。');
+      const id=form.dataset.id;
+      const payload={name:data.name.trim(),group_id:data.group_id || null};
+      if(!id)payload.prefix=data.prefix.trim();
+      await api(id?`/api/receipt-addresses/${encodeURIComponent(id)}`:'/api/receipt-addresses',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
+      modal.close();resetReceiptAddresses();await loadReceiptAddresses();toast(id?'收票地址已保存。':'收票地址已创建。');
     }else if(kind==='mailbox'){
       const id=form.dataset.id;
-      const payload={name:data.name.trim(),address:data.address.trim(),host:data.host.trim(),port:993,username:data.username.trim(),folder:data.folder.trim(),group_id:id?(form.dataset.group || null):(data.group_id || null),enabled:data.enabled==='on'};
+      const payload={name:data.name.trim(),address:data.address.trim(),host:data.host.trim(),port:993,username:data.username.trim(),folder:data.folder.trim(),group_id:data.group_id || null,enabled:data.enabled==='on'};
       if(data.password)payload.password=data.password;
       await api(id?`/api/mailboxes/${encodeURIComponent(id)}`:'/api/mailboxes',{method:id?'PATCH':'POST',body:JSON.stringify(payload)});
       modal.close();mailboxData=null;await loadMailboxes();toast(id?'邮箱设置已保存。':'邮箱已绑定，将从新收到的邮件开始收票。');
@@ -659,14 +664,13 @@ async function submitOnlineForm(form) {
   }catch(error){errorBox.textContent=error.message;}
   finally{button.disabled=false;button.textContent=original;modalBusy=false;}
 }
-document.addEventListener('change',event=>{if(event.target.id==='space-select')switchGroup(event.target.value);});
 document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-action]');
   if(!button)return;
   const action=button.dataset.action,id=button.dataset.id;
   if(action==='auth-mode'){authMode=button.dataset.mode;renderAuth();return;}
   if(action==='logout'){
-    await runMutation(button,async()=>{await api('/api/auth/logout',{method:'POST'});currentUser=null;activeGroupId='';localStorage.removeItem('invoice.activeGroup');state={invoices:[],projects:[],quotas:[],batches:[],summary:{},capabilities:{},groups:[]};selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();modal.close();renderAuth();});return;
+    await runMutation(button,async()=>{await api('/api/auth/logout',{method:'POST'});currentUser=null;importGroup='';batchGroupFilter='';settingsGroupFilter='';mailboxGroupFilter='';state={invoices:[],projects:[],quotas:[],batches:[],summary:{},capabilities:{},groups:[]};selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();modal.close();renderAuth();});return;
   }
   if(action==='new-group'){
     openModal('创建群组','邀请团队成员，共同整理指定的发票。','<div class="form-stack"><label class="field"><span>群组名称</span><input name="name" placeholder="例如：行政报销小组" maxlength="100" required></label><label class="field"><span>团队说明</span><textarea name="description" maxlength="1000" placeholder="填写团队用途或协作约定（选填）"></textarea></label></div>','<button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">创建群组</button>','group');return;
@@ -674,8 +678,7 @@ document.addEventListener('click',async event=>{
   if(action==='join-group'){
     openModal('加入群组','向群主或管理员获取邀请码。','<label class="field"><span>邀请码</span><input name="token" placeholder="粘贴完整邀请码" autocomplete="off" required></label>','<button type="button" class="btn" data-action="close-modal">取消</button><button type="submit" class="btn primary">加入群组</button>','join-group');return;
   }
-  if(action==='open-group'){await switchGroup(id);location.hash='invoices';return;}
-  if(action==='personal-space'){await switchGroup('');return;}
+  if(action==='open-group'){filters.group_id=id;selected.clear();location.hash='invoices';if(activePage==='invoices')renderPage();return;}
   if(action==='go-groups'){modal.close();location.hash='groups';return;}
   if(action==='group-settings'){groupSettings(id);return;}
   if(action==='transfer-group'){await runMutation(button,()=>transferGroupModal(id));return;}
@@ -707,6 +710,7 @@ document.addEventListener('click',async event=>{
     if(!confirm(`将“${button.dataset.name}”移出团队？对方的发票将停止在本团队共享，涉及其发票或由其创建的未完成报销单会取消。原件及已报销状态保留，团队收票配置转回对方的个人空间并暂停。`))return;
     await runMutation(button,async()=>{await api(`/api/groups/${encodeURIComponent(button.dataset.group)}/members/${encodeURIComponent(id)}`,{method:'DELETE'});selected.clear();matchData=null;mailboxData=null;resetReceiptAddresses();await refresh();await showMembers(button.dataset.group);toast('成员已移出群组，发票仍归原上传者所有。');});return;
   }
+  if(action==='clear-mailbox-filter'){mailboxGroupFilter='';renderPage();return;}
   if(action==='reload-mailboxes'){mailboxData=null;await loadMailboxes();return;}
   if(action==='mailbox-results'){
     await runMutation(button,async()=>{
@@ -743,15 +747,15 @@ function resetReceiptAddresses() {
   receiptLoading=false;
 }
 function renderReceiptAddresses() {
-  const canCreate=!!receiptData?.configured && canManageQuota();
+  const canCreate=!!receiptData?.configured;
   const header=`<div class="panel-header"><div><h2>域名收票地址</h2><p>使用专属地址收发票，无需绑定个人邮箱。</p></div><div class="actions"><button class="btn small" data-action="refresh-receipt-addresses" ${receiptLoading?'disabled':''}>${receiptLoading?'刷新中…':'刷新'}</button>${canCreate?'<button class="btn primary small" data-action="new-receipt-address">＋ 创建地址</button>':''}</div></div>`;
   if(receiptError)return `<div class="panel">${header}<div class="panel-body"><p class="inline-error">${esc(receiptError)}</p></div></div>`;
   if(!receiptData)return `<div class="panel">${header}<div class="receipt-loading"><span class="spinner" aria-hidden="true"></span><p>正在读取收票地址…</p></div></div>`;
-  if(!receiptData.configured)return `<div class="panel">${header}<div class="receipt-unconfigured"><h3>尚未启用域名收票</h3><p>启用后，可以创建专属收票地址。你也可以使用下方的已有邮箱收票。</p></div></div>`;
-  const addresses=receiptData.addresses || [];
-  const cards=addresses.map(address=>`<article class="receipt-address-card"><div class="receipt-address-head"><div><h3>${esc(address.name || address.prefix)}</h3><p>${address.last_received?'最近收票 '+esc(formatTimestamp(address.last_received)):'尚未收到邮件'}</p></div><span class="badge ${address.enabled?'available':''}">${address.enabled?'收票中':'已暂停'}</span></div><div class="receipt-address-copy"><input id="receipt-address-${esc(address.id)}" aria-label="${esc(address.name || address.prefix)}的收票地址" value="${esc(address.address)}" readonly spellcheck="false"><button class="btn small" data-action="copy-receipt-address" data-id="${esc(address.id)}">复制</button></div><div class="receipt-address-footer"><span>${activeGroupId?'归入 '+esc(currentGroup()?.name || '当前群组'):'归入个人票库'}</span><div class="actions"><button class="link-button" data-action="receipt-deliveries" data-id="${esc(address.id)}">收票记录</button>${address.can_manage?`<button class="link-button ${address.enabled?'danger-text':''}" data-action="toggle-receipt-address" data-id="${esc(address.id)}" data-enabled="${address.enabled?'false':'true'}">${address.enabled?'暂停收票':'启用收票'}</button>`:''}</div></div></article>`).join('');
-  const content=addresses.length?`<div class="receipt-address-grid">${cards}</div>`:empty('一个地址，接住新发票',canCreate?'创建一个专属地址，开票时填写或将发票邮件转发至这里，新发票将自动识别后进入待核对。':'群组管理员可以创建专属收票地址，新发票将自动归入本组待核对。',canCreate?'<button class="btn primary" data-action="new-receipt-address">创建收票地址</button>':'','✉');
-  return `<div class="panel">${header}${content}${addresses.length?'<p class="receipt-section-note">发往启用地址的新发票将自动识别后进入待核对。地址创建后保持不变，可以随时暂停收票。</p>':''}</div>`;
+  if(!receiptData.configured && !receiptData.addresses?.length)return `<div class="panel">${header}<div class="receipt-unconfigured"><h3>尚未启用域名收票</h3><p>启用后，可以创建专属收票地址。你也可以使用下方的已有邮箱收票。</p></div></div>`;
+  const addresses=(receiptData.addresses || []).filter(address=>matchesGroup(address,mailboxGroupFilter));
+  const cards=addresses.map(address=>`<article class="receipt-address-card"><div class="receipt-address-head"><div><h3>${esc(address.name || address.prefix)}</h3><p>${address.last_received?'最近收票 '+esc(formatTimestamp(address.last_received)):'尚未收到邮件'}</p></div><span class="badge ${address.enabled?'available':''}">${address.enabled?'收票中':'已暂停'}</span></div><div class="receipt-address-copy"><input id="receipt-address-${esc(address.id)}" aria-label="${esc(address.name || address.prefix)}的收票地址" value="${esc(address.address)}" readonly spellcheck="false"><button class="btn small" data-action="copy-receipt-address" data-id="${esc(address.id)}">复制</button></div><div class="receipt-address-footer"><span>归入 ${esc(groupName(address.group_id))}</span><div class="actions"><button class="link-button" data-action="receipt-deliveries" data-id="${esc(address.id)}">收票记录</button>${address.can_manage?`<button class="link-button" data-action="edit-receipt-address" data-id="${esc(address.id)}">编辑</button><button class="link-button ${address.enabled?'danger-text':''}" data-action="toggle-receipt-address" data-id="${esc(address.id)}" data-enabled="${address.enabled?'false':'true'}">${address.enabled?'暂停收票':'启用收票'}</button>`:''}</div></div></article>`).join('');
+  const content=addresses.length?`<div class="receipt-address-grid">${cards}</div>`:receiptData.addresses?.length?empty('没有符合归属的收票地址','更换归属筛选，或创建新的收票地址。','<button class="btn" data-action="clear-mailbox-filter">清除归属筛选</button>','✉'):empty('一个地址，接住新发票',canCreate?'创建一个专属地址，开票时填写或将发票邮件转发至这里，新发票将自动识别后进入待核对。':'群组管理员可以创建专属收票地址，新发票将自动归入本组待核对。',canCreate?'<button class="btn primary" data-action="new-receipt-address">创建收票地址</button>':'','✉');
+  return `<div class="panel">${header}${!receiptData.configured?'<p class="receipt-section-note">域名收票尚未启用，可继续管理已有地址。</p>':''}${content}${addresses.length?'<p class="receipt-section-note">发往启用地址的新发票将自动识别后进入待核对。邮箱地址保持不变；修改归属仅影响后续邮件。配置和收票记录仅本人可见。</p>':''}</div>`;
 }
 function refreshReceiptSection() {
   const section=$('#receipt-addresses-section');
@@ -759,24 +763,25 @@ function refreshReceiptSection() {
 }
 async function loadReceiptAddresses() {
   if(receiptLoading || !currentUser)return;
-  const generation=receiptGeneration,scope=activeGroupId,userId=currentUser.id;
+  const generation=receiptGeneration,userId=currentUser.id;
   receiptLoading=true;receiptError='';refreshReceiptSection();
-  const isCurrent=()=>generation===receiptGeneration && scope===activeGroupId && userId===currentUser?.id;
+  const isCurrent=()=>generation===receiptGeneration && userId===currentUser?.id;
   try {
     const data=await api('/api/receipt-addresses');
     if(!isCurrent())return;
-    receiptData={...data,addresses:(data.addresses || []).filter(address=>(address.group_id || '')===scope)};
+    receiptData=data;
   } catch(error) {
     if(isCurrent())receiptError=error.message;
   } finally {
     if(isCurrent()){receiptLoading=false;refreshReceiptSection();}
   }
 }
-function receiptAddressModal() {
-  if(!receiptData?.configured || !canManageQuota())return;
-  const domain=receiptData.domain;
-  const target=currentGroup()?.name || '个人票库';
-  openModal('创建收票地址','给个人或团队准备一个专属的发票收件地址。',`<div class="form-stack"><label class="field"><span>地址名称</span><input name="name" placeholder="例如：差旅发票" maxlength="100" required></label><label class="field"><span>自定义前缀</span><div class="receipt-prefix-input"><input name="prefix" placeholder="例如：travel" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="receipt-prefix-help"><span>@${esc(domain)}</span></div><small id="receipt-prefix-help">最多 64 位，可用英文字母、数字、点、下划线或短横线。地址创建后无法更名，可暂停收票。</small></label><div class="receipt-destination"><span>发票归入</span><strong>${esc(target)}</strong></div><p class="hint">发送至这个地址的新发票将自动识别后进入待核对。${activeGroupId?'群组成员可以查看并使用归入本组的发票。':'发票默认仅你自己可见。'}</p></div>`,'<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">创建地址</button>','receipt-address');
+function receiptAddressModal(id = '') {
+  if(!receiptData || (!id && !receiptData.configured))return;
+  const address=id?receiptData.addresses.find(a=>a.id===id):null;
+  if(id && !address)return;
+  const prefix=address?`<label class="field"><span>邮箱地址</span><input value="${esc(address.address)}" readonly></label>`:`<label class="field"><span>自定义前缀</span><div class="receipt-prefix-input"><input name="prefix" placeholder="例如：travel" maxlength="64" autocomplete="off" autocapitalize="none" spellcheck="false" required aria-describedby="receipt-prefix-help"><span>@${esc(receiptData.domain)}</span></div><small id="receipt-prefix-help">最多 64 位，可用英文字母、数字、点、下划线或短横线。邮箱地址创建后保持不变。</small></label>`;
+  openModal(id?'编辑收票地址':'创建收票地址','发票归本人所有，可按归属分享至群组。',`<div class="form-stack"><label class="field"><span>地址名称</span><input name="name" value="${esc(address?.name || '')}" placeholder="例如：差旅发票" maxlength="100" required></label>${prefix}<label class="field"><span>发票归入</span><select name="group_id">${groupOptions(address?.group_id || '')}</select><small>邮箱配置和收票记录仅你可见。${id?'修改归属只影响后续邮件。':''}</small></label></div>`,`${id?`<button type="button" class="btn danger left" data-action="delete-receipt-address" data-id="${esc(id)}">删除地址</button>`:''}<button class="btn" type="button" data-action="close-modal">取消</button><button class="btn primary" type="submit">${id?'保存设置':'创建地址'}</button>`,'receipt-address',`data-id="${esc(id)}"`);
 }
 async function showReceiptDeliveries(addressId) {
   const address=receiptData?.addresses?.find(item=>item.id===addressId);
@@ -796,6 +801,11 @@ document.addEventListener('click',async event=>{
   const action=button.dataset.action,id=button.dataset.id;
   if(action==='refresh-receipt-addresses'){await loadReceiptAddresses();return;}
   if(action==='new-receipt-address'){receiptAddressModal();return;}
+  if(action==='edit-receipt-address'){receiptAddressModal(id);return;}
+  if(action==='delete-receipt-address'){
+    if(!confirm('删除这个收票地址？后续邮件将不再接收，已有发票保留，已接收邮件按原归属完成处理。地址不能被重新注册。'))return;
+    await runMutation(button,async()=>{await api(`/api/receipt-addresses/${encodeURIComponent(id)}`,{method:'DELETE'});modal.close();resetReceiptAddresses();await loadReceiptAddresses();toast('收票地址已删除。');});return;
+  }
   if(action==='copy-receipt-address'){
     const address=receiptData?.addresses?.find(item=>item.id===id);
     if(!address)return;

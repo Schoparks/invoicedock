@@ -189,21 +189,32 @@ class MailboxTests(unittest.TestCase):
             self.assertIsNone(row['group_id'])
             self.assertEqual(row['enabled'], 0)
 
-    def test_group_mailboxes_require_admin_and_preserve_original_owner(self):
+    def test_group_mailboxes_are_creator_private(self):
         inbox = self.bind(group_id='g1')
-        self.user['id'] = 'u2'
-        self.assertEqual(len(self.client.get('/api/mailboxes').json()['mailboxes']), 1)
         self.inbox.messages[1] = message('team.xml')
         self.assertEqual(self.sync(inbox)['imported'], 1)
         self.assertEqual(self.imports, [('team.xml', 'u1', 'g1')])
-        for user_id in ('u3', 'u4'):
+        for user_id in ('u2', 'u3', 'u4'):
             self.user['id'] = user_id
             self.assertEqual(self.client.get('/api/mailboxes').json()['mailboxes'], [])
-            self.assertEqual(self.client.delete('/api/mailboxes/' + inbox['id']).status_code, 404)
-        self.user['id'] = 'u2'
-        self.assertEqual(self.client.delete('/api/mailboxes/' + inbox['id']).status_code, 200)
+            base = '/api/mailboxes/' + inbox['id']
+            for response in (self.client.delete(base), self.client.patch(base, json={'name':'forbidden'}),
+                             self.client.get(base+'/results'), self.client.post(base+'/sync'), self.client.post(base+'/retry')):
+                self.assertEqual(response.status_code, 404, response.text)
+        self.user['id'] = 'u1'
+        self.assertEqual(self.client.delete('/api/mailboxes/'+inbox['id']).status_code, 200)
         with db.connection() as connection:
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM mail_results').fetchone()[0], 0)
+
+    def test_member_can_bind_and_edit_own_destination(self):
+        self.user['id'] = 'u3'
+        inbox = self.bind(group_id='g1')
+        response = self.client.patch('/api/mailboxes/'+inbox['id'], json={'name':'Personal','group_id':None})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()['group_id'])
+        self.inbox.messages[1] = message('personal.xml')
+        self.assertEqual(self.sync(inbox)['imported'], 1)
+        self.assertEqual(self.imports, [('personal.xml','u3',None)])
 
     def test_ssrf_rejects_private_and_mixed_dns_before_connecting(self):
         for address in ('127.0.0.1', '10.1.2.3', '169.254.169.254', '192.168.1.1', '::1', '::ffff:127.0.0.1', '224.0.0.1'):

@@ -74,6 +74,48 @@ def _solve(
     return selected, best * scale
 
 
+_REVERSED_BYTES = bytes(int(f'{value:08b}'[::-1], 2) for value in range(256))
+
+
+def _prefer_sources(items, total, priorities):
+    """同额时先最少使用他人的群组票金额，再最少使用本人群组票金额。"""
+    items = [item for item in items if item[1] <= total]
+    smaller = [item for item in items if item[1] < total]
+    if sum(amount for _, amount in smaller) < total:
+        single = min((item for item in items if item[1] == total), key=lambda item: priorities[item[0]])
+        return [single[0]]
+    scale = reduce(gcd, (amount for _, amount in items))
+    target = total // scale
+    mask = (1 << (target + 1)) - 1
+
+    def reachable(pool):
+        bits = 1
+        for _, amount in pool:
+            bits |= (bits << (amount // scale)) & mask
+        return bits
+
+    def minimum_contribution(pool_bits, earlier_bits, amount):
+        width = amount + 1
+        size = (width + 7) // 8
+        earlier_bits &= (1 << width) - 1
+        reversed_bits = int.from_bytes(earlier_bits.to_bytes(size, 'little').translate(_REVERSED_BYTES), 'big') >> (size * 8 - width)
+        possible = pool_bits & reversed_bits
+        return (possible & -possible).bit_length() - 1
+
+    personal = [item for item in items if priorities[item[0]] == 0]
+    owned = [item for item in items if priorities[item[0]] == 1]
+    shared = [item for item in items if priorities[item[0]] == 2]
+    foreign_total = minimum_contribution(reachable(shared), reachable(personal + owned), target)
+    owned_total = minimum_contribution(reachable(owned), reachable(personal), target - foreign_total)
+    amounts = (target - foreign_total - owned_total, owned_total, foreign_total)
+    selected = []
+    for pool, amount in zip((personal, owned, shared), amounts):
+        if amount:
+            ids, _ = _solve(pool, amount * scale, 'below')
+            selected.extend(ids)
+    return selected
+
+
 def best_combinations(
     invoices: list[dict], target_cents: int, limit: int = 3, *, direction: str = "above"
 ) -> list[dict]:
@@ -90,6 +132,7 @@ def best_combinations(
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
         raise ValueError("建议组合数须在 1 至 10 之间")
     candidates = []
+    priorities = {}
     seen_ids = set()
     positive_count = 0
     for invoice in invoices:
@@ -107,8 +150,20 @@ def best_combinations(
         if invoice_id in seen_ids:
             raise ValueError("候选发票编号重复")
         seen_ids.add(invoice_id)
+        priority = invoice.get('source_priority', 0)
+        if type(priority) is not int or priority not in (0, 1, 2):
+            raise ValueError('发票来源优先级不正确')
+        priorities[invoice_id] = priority
         candidates.append((invoice_id, amount))
-    first_ids, first_total = _solve(candidates, target_cents, direction)
+    candidates.sort(key=lambda item: priorities[item[0]])
+
+    def solve(items):
+        chosen, total = _solve(items, target_cents, direction)
+        if chosen and len({priorities[item[0]] for item in items}) > 1:
+            chosen = _prefer_sources(items, total, priorities)
+        return chosen, total
+
+    first_ids, first_total = solve(candidates)
     if not first_ids:
         return []
     results = [{"invoice_ids": first_ids, "total_cents": first_total,
@@ -121,7 +176,7 @@ def best_combinations(
     excluded_ids = [first_ids[index * len(first_ids) // trials] for index in range(trials)]
     alternatives = []
     for excluded_id in excluded_ids:
-        chosen, total = _solve([item for item in candidates if item[0] != excluded_id], target_cents, direction)
+        chosen, total = solve([item for item in candidates if item[0] != excluded_id])
         key = frozenset(chosen)
         if not chosen or key in seen:
             continue
@@ -131,5 +186,8 @@ def best_combinations(
         # 同额组合已经达到最优，无须为了凑齐搜索次数继续计算。
         if sum(item["total_cents"] == first_total for item in alternatives) >= limit - 1:
             break
-    alternatives.sort(key=lambda item: item["total_cents"], reverse=direction == "below")
+    amount_by_id = dict(candidates)
+    alternatives.sort(key=lambda item: (item['total_cents'] * (-1 if direction == 'below' else 1),
+        sum(amount_by_id[i] for i in item['invoice_ids'] if priorities[i] == 2),
+        sum(amount_by_id[i] for i in item['invoice_ids'] if priorities[i] == 1)))
     return results + alternatives[:limit - 1]

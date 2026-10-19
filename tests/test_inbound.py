@@ -204,8 +204,7 @@ class InboundTests(unittest.TestCase):
         token = self.ok(self.client.post(f"/api/groups/{group['id']}/invites"))['token']
         self.ok(self.other.post('/api/groups/join',json={'token':token}))
         address = self.address('team',group_id=group['id'])
-        visible = self.ok(self.other.get('/api/receipt-addresses'))['addresses'][0]
-        self.assertFalse(visible['can_manage'])
+        self.assertEqual(self.ok(self.other.get('/api/receipt-addresses'))['addresses'], [])
         self.assertEqual(self.other.patch('/api/receipt-addresses/'+address['id'],json={'enabled':False}).status_code,404)
         self.assertEqual(self.other.get('/api/receipt-addresses/'+address['id']+'/deliveries').status_code,404)
         raw = self.mail(('group.xml',self.xml('INBOUND0003')))
@@ -256,6 +255,43 @@ class InboundTests(unittest.TestCase):
         for item in items:
             self.assertEqual((item['date'],item['amount_cents'],item['verified']),('2026-10-15',12850,False))
         self.assertTrue(any('OCR' in i['source'] for i in items))
+
+    def test_member_address_privacy_edit_delete_and_frozen_queue(self):
+        group = self.ok(self.client.post('/api/groups', json={'name':'归属组'}))
+        token = self.ok(self.client.post(f"/api/groups/{group['id']}/invites"))['token']
+        self.ok(self.other.post('/api/groups/join', json={'token':token}))
+        address = self.ok(self.other.post('/api/receipt-addresses', json={'prefix':'member-owned','name':'组收票','group_id':group['id']}))
+        self.assertEqual(self.ok(self.client.get('/api/receipt-addresses'))['addresses'], [])
+        base = '/api/receipt-addresses/'+address['id']
+        for response in (self.client.patch(base,json={'name':'forbidden'}), self.client.delete(base), self.client.get(base+'/deliveries'), self.client.post(base+'/retry',json={'delivery_id':'unknown'})):
+            self.assertEqual(response.status_code, 404, response.text)
+        self.send(self.mail(('before.xml',self.xml('BEFORE-EDIT'))),address['address'])
+        self.ok(self.other.patch(base, json={'name':'个人收票','group_id':None}))
+        self.send(self.mail(('after.xml',self.xml('AFTER-EDIT'))),address['address'])
+        self.ok(self.other.delete(base))
+        self.assertEqual(self.ok(self.other.get('/api/receipt-addresses'))['addresses'], [])
+        self.assertEqual(self.other.patch(base,json={'enabled':True}).status_code,404)
+        self.assertEqual(self.other.post('/api/receipt-addresses',json={'prefix':'member-owned','name':'抢占'}).status_code,409)
+        raw = self.mail(('deleted.xml',self.xml('DELETED')))
+        self.assertEqual(self.service.post('/api/inbound/email',content=raw,headers=self.signature(raw,address['address'])).status_code,404)
+        self.assertEqual(inbound.process_pending(),2)
+        invoices = self.ok(self.other.get('/api/state'))['invoices']
+        shares = {i['number']:i['shared_group_ids'] for i in invoices}
+        self.assertEqual(shares, {'BEFORE-EDIT':[group['id']], 'AFTER-EDIT':[]})
+        self.assertEqual([i['number'] for i in self.ok(self.client.get('/api/state',params={'unified':'true'}))['invoices']], ['BEFORE-EDIT'])
+
+    def test_receipt_migration_preserves_old_queued_destination(self):
+        group = self.ok(self.client.post('/api/groups',json={'name':'迁移组'}))
+        address = self.address('migration',group_id=group['id'])
+        self.send(self.mail(('queued.xml',self.xml('MIGRATE-QUEUED'))),address['address'])
+        with db.connection(write=True) as connection:
+            connection.execute('ALTER TABLE inbound_deliveries DROP COLUMN group_id')
+            connection.execute('ALTER TABLE receipt_addresses DROP COLUMN deleted_at')
+        inbound.initialize_inbound()
+        self.ok(self.client.patch('/api/receipt-addresses/'+address['id'],json={'group_id':None}))
+        inbound.process_pending()
+        invoice = self.ok(self.client.get('/api/state'))['invoices'][0]
+        self.assertEqual(invoice['shared_group_ids'], [group['id']])
 
 
 if __name__ == '__main__': unittest.main()

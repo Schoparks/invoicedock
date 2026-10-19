@@ -99,6 +99,8 @@ def invoice_dict(row, raw=False, user_id=None, db=None):
     item.pop('file_hash', None)
     item['can_edit'] = item.get('owner_id') == user_id
     item['shared_group_ids'] = [r[0] for r in db.execute('SELECT group_id FROM invoice_shares WHERE invoice_id=?', (item['id'],))] if db is not None and item['can_edit'] else []
+    item['groups'] = [dict(r) for r in db.execute('SELECT g.id,g.name FROM invoice_shares s JOIN groups g ON g.id=s.group_id JOIN group_members m ON m.group_id=g.id WHERE s.invoice_id=? AND m.user_id=? ORDER BY g.created_at,g.id', (item['id'], user_id))] if db is not None else []
+    item['source_priority'] = (1 if item['groups'] else 0) if item['can_edit'] else 2
     if not raw:
         item.pop('raw_text', None)
     return item
@@ -217,17 +219,25 @@ def authorize_scope(db, row, user_id, admin=False):
     return None
 
 
-def scoped_rows(db, table, user_id, group_id=None):
+def scoped_rows(db, table, user_id, group_id=None, *, unified=False):
     if group_id:
         require_group(db, user_id, group_id)
         return db.execute(f'SELECT * FROM {table} WHERE group_id=? ORDER BY rowid DESC', (group_id,)).fetchall()
+    if unified:
+        return db.execute(f'''SELECT * FROM {table} t WHERE (owner_id=? AND group_id IS NULL)
+            OR EXISTS (SELECT 1 FROM group_members m WHERE m.group_id=t.group_id AND m.user_id=?)
+            ORDER BY rowid DESC''', (user_id, user_id)).fetchall()
     return db.execute(f'SELECT * FROM {table} WHERE owner_id=? AND group_id IS NULL ORDER BY rowid DESC', (user_id,)).fetchall()
 
 
-def visible_invoices(db, user_id, group_id=None):
+def visible_invoices(db, user_id, group_id=None, *, unified=False):
     if group_id:
         require_group(db, user_id, group_id)
         rows = db.execute('SELECT i.*,u.name AS owner_name FROM invoices i JOIN invoice_shares s ON s.invoice_id=i.id LEFT JOIN users u ON u.id=i.owner_id WHERE s.group_id=? ORDER BY i.created_at DESC,i.id', (group_id,))
+    elif unified:
+        rows = db.execute('''SELECT i.*,u.name AS owner_name FROM invoices i LEFT JOIN users u ON u.id=i.owner_id
+            WHERE i.owner_id=? OR EXISTS (SELECT 1 FROM invoice_shares s JOIN group_members m ON m.group_id=s.group_id
+            WHERE s.invoice_id=i.id AND m.user_id=?) ORDER BY i.created_at DESC,i.id''', (user_id,user_id))
     else:
         rows = db.execute('SELECT i.*,u.name AS owner_name FROM invoices i LEFT JOIN users u ON u.id=i.owner_id WHERE i.owner_id=? ORDER BY i.created_at DESC,i.id', (user_id,))
     return [invoice_dict(r, user_id=user_id, db=db) for r in rows]
@@ -245,17 +255,17 @@ def share_import(db, invoice_id, owner_id, group_id):
 
 
 @app.get('/api/state')
-def state(group_id: str | None = None, user: dict = Depends(require_user)):
+def state(group_id: str | None = None, unified: bool = False, user: dict = Depends(require_user)):
     with connection() as db:
-        invoices = visible_invoices(db, user['id'], group_id)
-        batches = [batch_dict(db, r) for r in scoped_rows(db, 'batches', user['id'], group_id)]
+        invoices = visible_invoices(db, user['id'], group_id, unified=unified)
+        batches = [batch_dict(db, r) for r in scoped_rows(db, 'batches', user['id'], group_id, unified=unified)]
         for batch in batches:
-            role = require_group(db, user['id'], group_id)['role'] if group_id else None
+            role = require_group(db, user['id'], batch['group_id'])['role'] if batch['group_id'] else None
             batch['can_manage'] = batch['owner_id'] == user['id'] or role in ('owner', 'admin')
         groups = [dict(r) for r in db.execute('SELECT g.id,g.name,g.description,g.created_by,g.created_at,m.role,(SELECT COUNT(*) FROM group_members m2 WHERE m2.group_id=g.id) AS member_count FROM groups g JOIN group_members m ON m.group_id=g.id WHERE m.user_id=? ORDER BY g.created_at', (user['id'],))]
         return dict(user=user, groups=groups, active_group_id=group_id, invoices=invoices, batches=batches,
-            projects=[dict(r) for r in scoped_rows(db, 'projects', user['id'], group_id)],
-            quotas=[quota_dict(db, r) for r in scoped_rows(db, 'quotas', user['id'], group_id)],
+            projects=[dict(r) for r in scoped_rows(db, 'projects', user['id'], group_id, unified=unified)],
+            quotas=[quota_dict(db, r) for r in scoped_rows(db, 'quotas', user['id'], group_id, unified=unified)],
             summary=dict(total_count=len(invoices), total_cents=sum(i['amount_cents'] for i in invoices),
               available_cents=sum(i['amount_cents'] for i in invoices if i['status'] == 'available' and i['verified']),
               pending_review=sum(not i['verified'] for i in invoices),
@@ -521,7 +531,14 @@ def delete_quota(quota_id: str, user: dict = Depends(require_user)):
 
 
 def candidates(db, values, user_id):
-    invoices = visible_invoices(db, user_id, values.get('group_id'))
+    invoices = visible_invoices(db, user_id, values.get('group_id'), unified=values.get('unified') is True)
+    source = values.get('source', '')
+    if source not in ('', 'personal', 'owned'):
+        fail('发票来源筛选不正确')
+    if source == 'personal':
+        invoices = [i for i in invoices if i['source_priority'] == 0]
+    elif source == 'owned':
+        invoices = [i for i in invoices if i['owner_id'] == user_id]
     for key in ('date_from','date_to'):
         if values.get(key):
             valid_date(values[key])
@@ -536,8 +553,8 @@ def candidates(db, values, user_id):
 def quota_for_scope(db, quota_id, user_id, group_id):
     row = fetch(db, 'quotas', quota_id)
     authorize_scope(db, row, user_id)
-    if row.get('group_id') != (group_id or None):
-        fail('额度与当前个人/群组空间不一致')
+    if group_id and row.get('group_id') != group_id:
+        fail('额度与所选群组不一致')
     return quota_dict(db, row)
 
 
@@ -550,9 +567,15 @@ def match(values: dict, user: dict = Depends(require_user)):
     quota = None
     with connection() as db:
         if values.get('quota_id'):
-            quota = quota_for_scope(db, values['quota_id'], user['id'], values.get('group_id'))
+            quota = quota_for_scope(db, values['quota_id'], user['id'], None)
             if direction == 'above' and target > quota['remaining_cents']:
                 fail('额度不足：目标金额超过该月度额度的可用余额')
+            if quota['group_id']:
+                if values.get('group_id') and values['group_id'] != quota['group_id']:
+                    fail('所选发票群组与额度归属不一致')
+                if values.get('source') == 'personal':
+                    fail('个人发票来源不能使用群组额度')
+                values = {**values, 'group_id': quota['group_id']}
             category = values.get('category')
             if quota['category'] != '全部':
                 if category and category not in ('全部', quota['category']):
@@ -578,7 +601,7 @@ def match(values: dict, user: dict = Depends(require_user)):
     for combo in combos:
         combo['gap_cents'] = target - combo['total_cents']
         combo['invoices'] = [index[i] for i in combo['invoice_ids']]
-    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target, direction=direction, message=message)
+    return dict(combinations=combos, candidate_count=len(invoices), target_cents=target, direction=direction, message=message, group_id=quota['group_id'] if quota else values.get('group_id'))
 
 
 @app.post('/api/batches')
@@ -592,7 +615,12 @@ def create_batch(values: dict, user: dict = Depends(require_user)):
         if group_id:
             require_group(db, user['id'], group_id)
         invoices = [fetch(db, 'invoices', i) for i in ids]
-        if any(not invoice_access(db, i, user['id'], group_id) for i in invoices):
+        if values.get('unified') is True and group_id is None:
+            allowed_ids = {i['id'] for i in visible_invoices(db, user['id'], unified=True)}
+            allowed = all(i['id'] in allowed_ids for i in invoices)
+        else:
+            allowed = all(invoice_access(db, i, user['id'], group_id) for i in invoices)
+        if not allowed:
             fail('所选发票不在当前可用票池中', 403)
         if any(i['status'] != 'available' or not i['verified'] or i['amount_cents'] <= 0 for i in invoices):
             fail('有发票未核对或已被占用，请刷新后重新选择', 409)
@@ -604,11 +632,13 @@ def create_batch(values: dict, user: dict = Depends(require_user)):
             project = fetch(db, 'projects', project_id)
             authorize_scope(db, project, user['id'])
             if project.get('group_id') != group_id:
-                fail('项目与当前个人/群组空间不一致')
+                fail('项目与报销单归属不一致')
             if any(i['project_id'] != project_id for i in invoices):
                 fail('所选发票必须全部属于该项目，请先在票库中归类')
         if quota_id:
             quota = quota_for_scope(db, quota_id, user['id'], group_id)
+            if quota['group_id'] != group_id:
+                fail('额度与报销单归属不一致')
             month = quota['month']
             if quota['category'] != '全部' and any(i['category'] != quota['category'] for i in invoices):
                 fail('发票类别与月度额度不一致')
@@ -642,15 +672,19 @@ def update_batch(batch_id: str, values: dict, user: dict = Depends(require_user)
         return batch_dict(db, fetch(db, 'batches', batch_id))
 
 
-def workbook_bytes(invoices, projects=None):
+def workbook_bytes(invoices, projects=None, *, include_groups=False):
     projects = projects or {}
     book = Workbook()
     sheet = book.active
     sheet.title = '发票明细'
     headers = ['发票号码', '销售方', '购买方', '开票日期', '费用类别', '价税合计（元）', '所属项目', '状态', '已核对', '原件文件名', '备注']
+    if include_groups:
+        headers.extend(['共享群组', '发票所有者'])
     sheet.append(headers)
     for inv in invoices:
         values = [inv['number'], inv['seller'], inv['buyer'], inv['date'], inv['category'], inv['amount_cents'] / 100, projects.get(inv.get('project_id'), ''), STATUS_NAMES.get(inv.get('status'), ''), '是' if inv['verified'] else '否', inv.get('file_name', ''), inv.get('note', '')]
+        if include_groups:
+            values.extend(['、'.join(group['name'] for group in inv.get('groups', [])) or '个人', inv.get('owner_name', '')])
         sheet.append(values)
         # Strings are always literal text, including invoice fields beginning with '='.
         for col, value in enumerate(values, 1):
@@ -663,7 +697,7 @@ def workbook_bytes(invoices, projects=None):
     for cell in sheet[1]:
         cell.font = Font(color='FFFFFF', bold=True)
         cell.fill = PatternFill('solid', fgColor='365D84')
-    for key, width in zip('ABCDEFGHIJK', [25, 32, 32, 15, 13, 20, 24, 15, 12, 35, 40]):
+    for key, width in zip('ABCDEFGHIJKLM', [25, 32, 32, 15, 13, 20, 24, 15, 12, 35, 40, 30, 20]):
         sheet.column_dimensions[key].width = width
     buffer = io.BytesIO()
     book.save(buffer)
@@ -675,11 +709,11 @@ def download(data, name, media_type):
 
 
 @app.get('/api/export')
-def export_library(group_id: str | None = None, user: dict = Depends(require_user)):
+def export_library(group_id: str | None = None, unified: bool = False, user: dict = Depends(require_user)):
     with connection() as db:
-        invoices = visible_invoices(db, user['id'], group_id)
-        projects = {r['id']: r['name'] for r in scoped_rows(db, 'projects', user['id'], group_id)}
-    return download(workbook_bytes(invoices, projects), f'发票明细_{date.today()}.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        invoices = visible_invoices(db, user['id'], group_id, unified=unified)
+        projects = {r['id']: r['name'] for r in scoped_rows(db, 'projects', user['id'], group_id, unified=unified)}
+    return download(workbook_bytes(invoices, projects, include_groups=unified), f'发票明细_{date.today()}.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
 
 
 @app.get('/api/batches/{batch_id}/export')

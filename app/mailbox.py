@@ -147,12 +147,6 @@ def _public(row) -> dict:
 
 
 def _allowed(db, user_id: str, mailbox) -> bool:
-    if mailbox['group_id']:
-        try:
-            require_group(db, user_id, mailbox['group_id'], admin=True)
-            return True
-        except HTTPException:
-            return False
     return mailbox['owner_id'] == user_id
 
 
@@ -310,11 +304,9 @@ def _values(values: dict, old: dict | None, user_id: str) -> dict:
     if data['group_id'] is not None:
         data['group_id'] = _field(data['group_id'], '小组编号', 100)
         with connection() as db:
-            require_group(db, user_id, data['group_id'], admin=True)
+            require_group(db, user_id, data['group_id'])
             # Changing scope must not leave the original creator outside the target group.
             require_group(db, data['owner_id'], data['group_id'])
-    if old and old['group_id'] != data['group_id']:
-        raise HTTPException(400, '邮箱绑定后不能更换所属范围，请删除后重新绑定')
     password = values.get('password', '')
     if not isinstance(password, str) or len(password) > 4096 or any(ord(c) < 32 for c in password):
         raise HTTPException(400, '邮箱授权码格式不正确')
@@ -328,7 +320,7 @@ def _values(values: dict, old: dict | None, user_id: str) -> dict:
 @router.get('')
 def list_mailboxes(user=Depends(require_user)):
     with connection() as db:
-        rows = db.execute('SELECT * FROM mailboxes WHERE owner_id=? OR group_id IS NOT NULL ORDER BY name,id', (user['id'],)).fetchall()
+        rows = db.execute('SELECT * FROM mailboxes WHERE owner_id=? ORDER BY name,id', (user['id'],)).fetchall()
         return {'mailboxes': [_public(row) for row in rows if _allowed(db, user['id'], row)]}
 
 
@@ -346,7 +338,7 @@ def create_mailbox(values: dict, user=Depends(require_user)):
                'owner_id', 'group_id', 'enabled', 'uid_validity', 'last_uid', 'last_sync', 'last_error')
     with LOCK, connection(write=True) as db:
         if data['group_id']:
-            require_group(db, user['id'], data['group_id'], admin=True)
+            require_group(db, user['id'], data['group_id'])
         db.execute(f"INSERT INTO mailboxes ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})", [data[key] for key in columns])
     return _public(data)
 
@@ -372,6 +364,8 @@ def update_mailbox(mailbox_id: str, values: dict, user=Depends(require_user)):
             current = _get_managed(db, mailbox_id, user['id'])
             if current['group_id'] != old['group_id']:
                 raise HTTPException(409, '邮箱归属已变化，请刷新后重新设置')
+            if data['group_id']:
+                require_group(db, user['id'], data['group_id'])
             db.execute(f"UPDATE mailboxes SET {','.join(key+'=?' for key in columns)},last_error='' WHERE id=?", [*[data[key] for key in columns], mailbox_id])
             if changed_inbox:
                 db.execute('DELETE FROM mail_results WHERE mailbox_id=?', (mailbox_id,))

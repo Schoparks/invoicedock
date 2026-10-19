@@ -187,6 +187,57 @@ class ScopedApiTests(unittest.TestCase):
         self.assertEqual(self.b.get('/api/state').status_code,401)
         self.assertEqual(self.b.get(invoice['file_url']).status_code,401)
 
+    def test_unified_view_keeps_account_and_share_boundaries(self):
+        invoice = self.upload()
+        gid = self.group['id']
+        self.ok(self.a.put('/api/invoices/'+invoice['id']+'/shares', json={'group_ids':[gid,self.group2['id']]}))
+        project = self.ok(self.a.post('/api/projects', json={'name':'组项目','group_id':gid}))
+        unified = self.ok(self.b.get('/api/state', params={'unified':'true'}))
+        self.assertEqual([i['id'] for i in unified['invoices']], [invoice['id']])
+        self.assertEqual(unified['invoices'][0]['groups'], [{'id':gid,'name':'出差组'}])
+        self.assertEqual([p['id'] for p in unified['projects']], [project['id']])
+        self.assertEqual(len(self.ok(self.a.get('/api/state', params={'unified':'true'}))['invoices']), 1)
+        self.assertEqual(self.ok(self.c.get('/api/state', params={'unified':'true'}))['invoices'], [])
+        self.assertEqual(self.ok(self.b.get('/api/state'))['invoices'], [])
+        from openpyxl import load_workbook
+        sheet = load_workbook(io.BytesIO(self.b.get('/api/export?unified=true').content)).active
+        self.assertEqual(sheet.max_row, 2)
+        self.assertEqual((sheet['L2'].value, sheet['M2'].value), ('出差组', '用户0'))
+        self.assertEqual(self.c.post('/api/batches', json={'name':'越权','unified':True,'invoice_ids':[invoice['id']]}).status_code, 403)
+        self.ok(self.a.put('/api/invoices/'+invoice['id']+'/shares', json={'group_ids':[]}))
+        self.assertEqual(self.ok(self.b.get('/api/state', params={'unified':'true'}))['invoices'], [])
+        self.assertEqual(self.b.post('/api/batches', json={'name':'失效分享','unified':True,'invoice_ids':[invoice['id']]}).status_code, 403)
+
+    def test_unified_match_priority_and_mixed_batch(self):
+        def add(client, amount, group=None):
+            return self.ok(client.post('/api/invoices', json={'seller':'合成商家','date':'2026-10-19','amount_cents':amount,'verified':True,'group_id':group}))
+        gid = self.group['id']
+        personal = add(self.b, 1200)
+        owned = add(self.b, 1200, gid)
+        shared = add(self.a, 1200, gid)
+        exact = add(self.a, 1100, gid)
+        def match(target, **extra):
+            return self.ok(self.b.post('/api/match', json={'target_cents':target,'unified':True,**extra}))['combinations'][0]
+        self.assertEqual(match(1100)['invoice_ids'], [exact['id']])
+        self.assertEqual(match(1200)['invoice_ids'], [personal['id']])
+        self.assertEqual(match(1200, group_id=gid)['invoice_ids'], [owned['id']])
+        self.assertEqual(match(1200, source='personal')['invoice_ids'], [personal['id']])
+        batch = self.ok(self.b.post('/api/batches', json={'name':'统一报销','unified':True,'invoice_ids':[personal['id'],shared['id']]}))
+        self.assertEqual(batch['total_cents'], 2400)
+        self.assertIsNone(batch['group_id'])
+        self.assertEqual(self.a.get('/api/batches/'+batch['id']+'/export').status_code, 403)
+        self.assertEqual(match(1200, group_id=gid)['invoice_ids'], [owned['id']])
+        quota = self.ok(self.a.post('/api/quotas', json={'month':'2026-10','category':'全部','amount_cents':5000,'group_id':gid}))
+        result = self.ok(self.b.post('/api/match', json={'unified':True,'target_cents':1200,'quota_id':quota['id']}))
+        self.assertEqual(result['group_id'], gid)
+        self.assertEqual(result['combinations'][0]['invoice_ids'], [owned['id']])
+        personal_batch = self.b.post('/api/batches', json={'name':'错误额度归属','unified':True,'invoice_ids':[owned['id']],'quota_id':quota['id']})
+        self.assertEqual(personal_batch.status_code, 400)
+        personal_quota = self.ok(self.b.post('/api/quotas', json={'month':'2026-10','category':'全部','amount_cents':5000}))
+        result = self.ok(self.b.post('/api/match', json={'unified':True,'target_cents':1200,'group_id':gid,'quota_id':personal_quota['id']}))
+        self.assertIsNone(result['group_id'])
+        self.assertEqual(result['combinations'][0]['invoice_ids'], [owned['id']])
+
 
 if __name__ == '__main__':
     unittest.main()

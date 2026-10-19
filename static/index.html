@@ -13,9 +13,9 @@
   <a class="skip-link" href="#main">跳到主要内容</a>
   <aside class="sidebar">
     <a class="brand" href="#invoices" aria-label="票栈首页"><span class="brand-symbol" aria-hidden="true">票</span><span>票栈<small>个人与团队发票管理</small></span></a>
-    <label class="space-switch"><span>当前空间</span><select id="space-select" aria-label="切换个人或群组空间"><option value="">个人空间</option></select></label><div class="nav-label">发票与报销</div>
+    <div class="nav-label">发票与报销</div>
     <nav aria-label="主要导航">
-      <a href="#invoices" data-page="invoices"><span class="nav-icon" aria-hidden="true">▤</span><span id="invoice-nav-label">我的票库</span><span id="invoice-count" class="nav-count">0</span></a>
+      <a href="#invoices" data-page="invoices"><span class="nav-icon" aria-hidden="true">▤</span><span id="invoice-nav-label">票库</span><span id="invoice-count" class="nav-count">0</span></a>
       <a href="#match" data-page="match"><span class="nav-icon" aria-hidden="true">⌘</span>智能匹配</a>
       <a href="#batches" data-page="batches"><span class="nav-icon" aria-hidden="true">☷</span>报销单</a>
       <div class="nav-divider"></div>
@@ -28,7 +28,7 @@
     <div class="account-note"><div class="account-avatar" id="account-avatar">票</div><div class="account-info"><strong id="account-name"></strong><small id="account-email"></small></div><button class="icon-btn" data-action="logout" aria-label="退出登录" title="退出登录">↪</button></div>
   </aside>
   <div class="workspace">
-    <header class="topbar"><span><span id="workspace-name">个人空间</span> <span class="breadcrumb">/ <span id="breadcrumb">我的票库</span></span></span><span class="topbar-right"><span id="today" class="today"></span><button class="mobile-logout link-button" data-action="logout">退出登录</button></span></header>
+    <header class="topbar"><span><span id="workspace-name">票栈</span> <span class="breadcrumb">/ <span id="breadcrumb">票库</span></span></span><span class="topbar-right"><span id="today" class="today"></span><button class="mobile-logout link-button" data-action="logout">退出登录</button></span></header>
     <main id="main" tabindex="-1"><div class="loading-state"><span class="spinner"></span><p>正在打开你的票栈…</p></div></main>
     <footer class="app-footer"><span>票栈 · 个人与团队</span><span>每一张发票，都有去处。</span></footer>
   </div>

@@ -10,6 +10,39 @@ from app.parsing import _ocr_config, _text_fields, expand_upload, parse_invoice
 
 
 class MatchingTests(unittest.TestCase):
+    def test_equal_amount_uses_own_sources_before_shared(self):
+        invoices = [{'id':'foreign','amount_cents':1000,'source_priority':2},
+                    {'id':'owned','amount_cents':1000,'source_priority':1},
+                    {'id':'personal','amount_cents':1000,'source_priority':0}]
+        for direction in ('above','below'):
+            self.assertEqual(best_combinations(invoices,1000,direction=direction)[0]['invoice_ids'], ['personal'])
+            self.assertEqual(best_combinations(invoices[:2],1000,direction=direction)[0]['invoice_ids'], ['owned'])
+        invoices = [{'id':'personal','amount_cents':1200,'source_priority':0},
+                    {'id':'f1','amount_cents':600,'source_priority':2},
+                    {'id':'f2','amount_cents':600,'source_priority':2}]
+        self.assertEqual(best_combinations(invoices,1000)[0]['invoice_ids'], ['personal'])
+        invoices.append({'id':'exact','amount_cents':1000,'source_priority':2})
+        self.assertEqual(best_combinations(invoices,1000)[0]['invoice_ids'], ['exact'])
+
+    def test_source_priority_matches_exhaustive_subsets(self):
+        rng = random.Random(19)
+        for _ in range(35):
+            invoices = [{'id':str(i),'amount_cents':rng.randint(1,20),'source_priority':rng.randrange(3)} for i in range(7)]
+            target = rng.randint(1,60)
+            subsets = [list(combo) for n in range(1,8) for combo in itertools.combinations(invoices,n)]
+            for direction in ('above','below'):
+                eligible = [combo for combo in subsets if (sum(i['amount_cents'] for i in combo)>=target if direction=='above' else sum(i['amount_cents'] for i in combo)<=target)]
+                def cost(combo):
+                    return (sum(i['amount_cents'] for i in combo) * (-1 if direction=='below' else 1),
+                            sum(i['amount_cents'] for i in combo if i['source_priority']==2),
+                            sum(i['amount_cents'] for i in combo if i['source_priority']==1))
+                result = best_combinations(invoices,target,limit=1,direction=direction)
+                if not eligible:
+                    self.assertEqual(result,[])
+                else:
+                    selected = [i for i in invoices if i['id'] in result[0]['invoice_ids']]
+                    self.assertEqual(cost(selected),min(map(cost,eligible)))
+
     def test_exact_match_and_no_reuse(self):
         invoices = [{"id": str(i), "amount_cents": amount} for i, amount in enumerate([681, 320, 319, 500])]
         results = best_combinations(invoices, 1000)

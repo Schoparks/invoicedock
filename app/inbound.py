@@ -97,6 +97,11 @@ def initialize_inbound() -> None:
             status TEXT NOT NULL CHECK(status IN ('imported','duplicate','ignored','failed')),
             error TEXT NOT NULL DEFAULT '', invoice_id TEXT,
             PRIMARY KEY(delivery_id,attachment_index))''')
+        if 'deleted_at' not in [r['name'] for r in db.execute('PRAGMA table_info(receipt_addresses)')]:
+            db.execute("ALTER TABLE receipt_addresses ADD COLUMN deleted_at TEXT NOT NULL DEFAULT ''")
+        if 'group_id' not in [r['name'] for r in db.execute('PRAGMA table_info(inbound_deliveries)')]:
+            db.execute('ALTER TABLE inbound_deliveries ADD COLUMN group_id TEXT')
+            db.execute('UPDATE inbound_deliveries SET group_id=(SELECT group_id FROM receipt_addresses a WHERE a.id=address_id)')
         db.execute('CREATE INDEX IF NOT EXISTS inbound_pending ON inbound_deliveries(status,received_at)')
         db.execute('CREATE INDEX IF NOT EXISTS receipt_address_owner ON receipt_addresses(owner_id,group_id)')
         # A crash can leave a claimed delivery unfinished; per-attachment results make replay safe.
@@ -104,11 +109,7 @@ def initialize_inbound() -> None:
 
 
 def _can_manage(db, address, user_id: str) -> bool:
-    if not address['group_id']:
-        return address['owner_id'] == user_id
-    member = db.execute('SELECT role FROM group_members WHERE group_id=? AND user_id=?',
-                        (address['group_id'], user_id)).fetchone()
-    return bool(member and member['role'] in ('owner', 'admin'))
+    return address['owner_id'] == user_id and not address['deleted_at']
 
 
 def _managed(db, address_id: str, user_id: str) -> dict:
@@ -138,10 +139,7 @@ def _prefix(value) -> str:
 @router.get('/api/receipt-addresses')
 def list_addresses(user=Depends(require_user)):
     with connection() as db:
-        rows = db.execute('''SELECT a.* FROM receipt_addresses a WHERE
-            (a.group_id IS NULL AND a.owner_id=?) OR EXISTS
-            (SELECT 1 FROM group_members m WHERE m.group_id=a.group_id AND m.user_id=?)
-            ORDER BY a.created_at,a.id''', (user['id'], user['id'])).fetchall()
+        rows = db.execute("SELECT * FROM receipt_addresses WHERE owner_id=? AND deleted_at='' ORDER BY created_at,id", (user['id'],)).fetchall()
         return {'domain': _domain(), 'configured': configured(),
                 'addresses': [_public(db, row, user['id']) for row in rows]}
 
@@ -160,10 +158,10 @@ def create_address(values: dict, user=Depends(require_user)):
         raise HTTPException(400, '群组编号格式不正确')
     row = {'id': uuid.uuid4().hex, 'prefix': prefix, 'domain': domain,
            'address': f'{prefix}@{domain}', 'name': name.strip(), 'owner_id': user['id'],
-           'group_id': group_id, 'enabled': 1, 'created_at': _now(), 'last_received': ''}
+           'group_id': group_id, 'enabled': 1, 'created_at': _now(), 'last_received': '', 'deleted_at': ''}
     with LOCK, connection(write=True) as db:
         if group_id:
-            require_group(db, user['id'], group_id, admin=True)
+            require_group(db, user['id'], group_id)
         try:
             fields = ','.join(row)
             db.execute(f"INSERT INTO receipt_addresses ({fields}) VALUES ({','.join('?' for _ in row)})", list(row.values()))
@@ -174,15 +172,36 @@ def create_address(values: dict, user=Depends(require_user)):
 
 @router.patch('/api/receipt-addresses/{address_id}')
 def update_address(address_id: str, values: dict, user=Depends(require_user)):
-    if set(values) != {'enabled'} or type(values['enabled']) is not bool:
-        raise HTTPException(400, '只能修改启用状态；地址和归属不能更改')
+    if not values or set(values) - {'name', 'group_id', 'enabled'}:
+        raise HTTPException(400, '只能修改名称、归属及启用状态')
     with LOCK, connection(write=True) as db:
         row = _managed(db, address_id, user['id'])
-        if values['enabled'] and row['group_id']:
-            require_group(db, row['owner_id'], row['group_id'])
-        db.execute('UPDATE receipt_addresses SET enabled=? WHERE id=?', (int(values['enabled']), address_id))
-        row['enabled'] = values['enabled']
+        if 'name' in values:
+            name = values['name']
+            if not isinstance(name, str) or not name.strip() or len(name) > 100 or any(ord(c) < 32 for c in name):
+                raise HTTPException(400, '请填写 1 至 100 字的地址名称')
+            row['name'] = name.strip()
+        if 'group_id' in values:
+            row['group_id'] = values['group_id'] or None
+        if 'enabled' in values:
+            if type(values['enabled']) is not bool:
+                raise HTTPException(400, '启用状态格式不正确')
+            row['enabled'] = values['enabled']
+        if row['group_id']:
+            require_group(db, user['id'], row['group_id'])
+        db.execute('UPDATE receipt_addresses SET name=?,group_id=?,enabled=? WHERE id=?',
+                   (row['name'], row['group_id'], int(row['enabled']), address_id))
         return _public(db, row, user['id'])
+
+
+@router.delete('/api/receipt-addresses/{address_id}')
+def delete_address(address_id: str, user=Depends(require_user)):
+    with LOCK, connection(write=True) as db:
+        _managed(db, address_id, user['id'])
+        # Reserve the address permanently so future invoices cannot reach another owner.
+        # Accepted deliveries finish with their original destination.
+        db.execute('UPDATE receipt_addresses SET enabled=0,deleted_at=? WHERE id=?', (_now(), address_id))
+    return {'ok': True}
 
 
 @router.get('/api/receipt-addresses/{address_id}/deliveries')
@@ -273,8 +292,8 @@ async def receive_email(request: Request):
                 output.flush()
                 os.fsync(output.fileno())
             received_at = _now()
-            db.execute('''INSERT INTO inbound_deliveries VALUES (?,?,?,?,?,?)''',
-                       (delivery_id, address['id'], digest, f'inbound/{delivery_id}.eml', received_at, 'queued'))
+            db.execute('''INSERT INTO inbound_deliveries(id,address_id,raw_hash,raw_path,received_at,status,group_id) VALUES (?,?,?,?,?,?,?)''',
+                       (delivery_id, address['id'], digest, f'inbound/{delivery_id}.eml', received_at, 'queued', address['group_id']))
             db.execute('UPDATE receipt_addresses SET last_received=? WHERE id=?', (received_at, address['id']))
     except Exception:
         if created:
@@ -316,7 +335,7 @@ def _process_delivery(delivery: dict) -> None:
             try:
                 if _importer is None:
                     raise RuntimeError('Importer is not configured')
-                result = _importer(attachment['data'], attachment['filename'], address['owner_id'], address['group_id'])
+                result = _importer(attachment['data'], attachment['filename'], address['owner_id'], delivery['group_id'])
                 status = result.get('status')
                 if status not in ('imported', 'duplicate'):
                     raise RuntimeError('Invalid importer result')
