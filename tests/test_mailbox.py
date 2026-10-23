@@ -206,6 +206,35 @@ class MailboxTests(unittest.TestCase):
         with db.connection() as connection:
             self.assertEqual(connection.execute('SELECT COUNT(*) FROM mail_results').fetchone()[0], 0)
 
+    def test_original_email_fetch_checks_creator_record_and_remote_uid_validity(self):
+        inbox = self.bind(group_id='g1')
+        self.inbox.messages[1] = message('fixture.xml')
+        self.sync(inbox)
+        rows = self.client.get('/api/mailboxes/'+inbox['id']+'/results').json()['results']
+        self.assertEqual(rows[0]['uid_validity'], '7')
+        url = f"/api/mailboxes/{inbox['id']}/messages/7/1/original"
+        response = self.client.get(url)
+        self.assertEqual(response.status_code,200,response.text)
+        self.assertEqual(response.json()['subject'],'发票')
+        self.assertEqual(response.json()['attachments'][0]['name'],'fixture.xml')
+        self.assertEqual(self.client.get(url+'?download=true').content,self.inbox.messages[1])
+        self.assertIn(('select', '\"INBOX\"', True),self.inbox.calls)
+        self.assertIn(('FETCH', '1', '(BODY.PEEK[])'),self.inbox.calls)
+        connections = self.network.call_count
+        for user_id in ('u2','u3','u4'):
+            self.user['id'] = user_id
+            self.assertEqual(self.client.get(url).status_code,404)
+            self.assertEqual(self.client.get(url+'?download=true').status_code,404)
+        self.assertEqual(self.network.call_count,connections)
+        self.user['id'] = 'u1'
+        self.assertEqual(self.client.get(url.replace('/7/1/','/7/2/')).status_code,404)
+        self.assertEqual(self.network.call_count,connections)
+        self.inbox.validity = '8'
+        self.inbox.messages[1] = message('wrong-new-message.xml')
+        previous_fetches = len([call for call in self.inbox.calls if call[0]=='FETCH'])
+        self.assertEqual(self.client.get(url).status_code,410)
+        self.assertEqual(len([call for call in self.inbox.calls if call[0]=='FETCH']),previous_fetches)
+
     def test_member_can_bind_and_edit_own_destination(self):
         self.user['id'] = 'u3'
         inbox = self.bind(group_id='g1')

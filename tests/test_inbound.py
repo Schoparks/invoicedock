@@ -1,5 +1,6 @@
 """Signed domain receipts exercise the real app, parser and tenant boundaries."""
 from email.message import EmailMessage
+import base64
 import hashlib
 import hmac
 import os
@@ -85,7 +86,72 @@ class InboundTests(unittest.TestCase):
         self.assertEqual(inbound.process_pending(), 0)
         records = self.ok(self.client.get(f"/api/receipt-addresses/{address['id']}/deliveries"))['deliveries']
         self.assertEqual((records[0]['status'],records[0]['results'][0]['status']), ('completed','imported'))
+        self.assertTrue((self.data/'inbound'/f"{event['id']}.eml").exists())
+
+    def test_original_email_with_inline_qr_is_private_and_expires_after_completion(self):
+        from io import BytesIO
+        from PIL import Image
+        image = BytesIO()
+        Image.new('RGB', (32, 32), 'black').save(image, format='PNG')
+        mail = EmailMessage()
+        mail['From'] = '开票平台 <issuer@example.test>'
+        mail['To'] = 'header-only@example.test'
+        mail['Subject'] = '<电子发票> 扫码查看'
+        mail.set_content('请扫描二维码查看发票。')
+        mail.add_alternative('<html><head><style>hidden css</style></head><body><p>请扫描二维码查看发票。</p><img src="cid:qr"><script>untrusted()</script><img alt="远程二维码" src="https://issuer.example.test/qr?code=fixture"><a href="javascript:alert(1)">不可执行</a></body></html>', subtype='html')
+        mail.get_payload()[1].add_related(image.getvalue(), maintype='image', subtype='png', cid='<qr>')
+        raw = mail.as_bytes()
+        group = self.ok(self.client.post('/api/groups', json={'name':'邮件权限组'}))
+        invite = self.ok(self.client.post('/api/groups/'+group['id']+'/invites'))['token']
+        self.ok(self.other.post('/api/groups/join', json={'token':invite}))
+        address = self.address(group_id=group['id'])
+        event = self.send(raw, address['address'])
+        inbound.process_pending()
+        base = f"/api/receipt-addresses/{address['id']}/deliveries"
+        url = base+'/'+event['id']+'/original'
+        record = self.ok(self.client.get(base))['deliveries'][0]
+        self.assertTrue(record['original_available'])
+        self.assertNotIn('raw_path', record)
+        data = self.ok(self.client.get(url))
+        self.assertEqual(data['subject'], '<电子发票> 扫码查看')
+        self.assertIn('请扫描二维码', data['body'])
+        self.assertNotIn('untrusted()', data['body'])
+        self.assertNotIn('hidden css', data['body'])
+        self.assertNotIn('javascript:', data['body'])
+        self.assertEqual(data['images'], [{'name':'邮件图片', 'src':'data:image/png;base64,'+base64.b64encode(image.getvalue()).decode()}])
+        self.assertEqual(data['remote_images'], [{'name':'远程二维码','url':'https://issuer.example.test/qr?code=fixture'}])
+        downloaded = self.client.get(url, params={'download':'true'})
+        self.assertEqual(downloaded.content, raw)
+        self.assertIn('attachment', downloaded.headers['content-disposition'])
+        self.assertEqual(downloaded.headers['cache-control'], 'no-store')
+        for client in (self.other, self.service):
+            for query in ('', '?download=true'):
+                self.assertEqual(client.get(url+query).status_code, 404 if client is self.other else 401)
+        other_address = self.address('different')
+        self.assertEqual(self.client.get(url.replace(address['id'],other_address['id'])).status_code,404)
+        self.assertEqual(self.client.get(url.replace(event['id'],'missing')).status_code,404)
+        with db.connection(write=True) as connection:
+            connection.execute("UPDATE inbound_deliveries SET received_at='2020-01-01T00:00:00+00:00' WHERE id=?",(event['id'],))
+        self.assertFalse(self.ok(self.client.get(base))['deliveries'][0]['original_available'])
+        self.assertEqual(self.client.get(url).status_code,410)
+        inbound.process_pending()
         self.assertFalse((self.data/'inbound'/f"{event['id']}.eml").exists())
+        self.assertEqual(self.ok(self.client.get(base))['deliveries'][0]['status'],'completed')
+
+    def test_failed_original_retained_and_old_cleaned_record_is_explicitly_unavailable(self):
+        address = self.address()
+        raw = self.mail(('retry.xml', self.xml('ORIGINAL-FAILED')))
+        inbound.configure_importer(lambda *args: (_ for _ in ()).throw(ValueError('测试失败')))
+        event = self.send(raw,address['address'])
+        inbound.process_pending()
+        with db.connection(write=True) as connection:
+            connection.execute("UPDATE inbound_deliveries SET received_at='2020-01-01T00:00:00+00:00' WHERE id=?",(event['id'],))
+        inbound.process_pending()
+        url = f"/api/receipt-addresses/{address['id']}/deliveries/{event['id']}/original"
+        self.assertEqual(self.client.get(url+'?download=true').content,raw)
+        with db.connection(write=True) as connection:
+            connection.execute("UPDATE inbound_deliveries SET status='completed',raw_path='' WHERE id=?",(event['id'],))
+        self.assertEqual(self.client.get(url).status_code,410)
 
     def test_same_invoice_formats_keep_only_pdf_regardless_of_attachment_order(self):
         import pymupdf

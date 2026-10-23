@@ -386,6 +386,7 @@ document.addEventListener('click',async event=>{
   if(action==='close-preview'){preview.close();return;}
   if(action==='preview-page'){const viewer=button.closest('[data-original-viewer]');const data=originalViewers.get(viewer);if(!button.disabled&&data)await loadOriginalViewer(viewer,data.page+Number(button.dataset.step));return;}
   if(action==='preview-original'){await previewOriginal(button);return;}
+  if(action==='preview-email'){await runMutation(button,()=>previewEmail(button));return;}
   if(action==='close-modal'){closeModal();return;}
   if(action==='new-invoice'){invoiceModal();return;}
   if(action==='edit-invoice'){invoiceModal(id);return;}
@@ -717,7 +718,7 @@ document.addEventListener('click',async event=>{
       const data=await api(`/api/mailboxes/${encodeURIComponent(id)}/results`);
       const names={imported:'已导入',duplicate:'重复跳过',ignored:'已忽略',failed:'失败'};
       const rows=data.results || [];
-      openModal('收票记录','最近处理的邮件附件与结果。',rows.length?`<div class="mail-results">${rows.map(row=>`<div class="mail-result"><div><strong>${esc(row.filename || '邮件')}</strong><span class="badge ${row.status==='failed'?'rejected':row.status==='imported'?'available':''}">${esc(names[row.status] || row.status)}</span></div><small>${esc(formatTimestamp(row.created_at))}${row.error?' · '+esc(row.error):''}</small></div>`).join('')}</div>`:empty('暂无收票记录','绑定后收到新邮件时，处理结果会显示在这里。','','✉'),'<button class="btn primary" data-action="close-modal">完成</button>');
+      openModal('收票记录','最近处理的邮件附件与结果。',rows.length?`<div class="mail-results">${rows.map(row=>`<div class="mail-result"><div><strong>${esc(row.filename || '邮件')}</strong><span class="badge ${row.status==='failed'?'rejected':row.status==='imported'?'available':''}">${esc(names[row.status] || row.status)}</span><button type="button" class="link-button" data-action="preview-email" data-url="/api/mailboxes/${encodeURIComponent(id)}/messages/${encodeURIComponent(row.uid_validity)}/${encodeURIComponent(row.uid)}/original">查看原件</button></div><small>${esc(formatTimestamp(row.created_at))}${row.error?' · '+esc(row.error):''}</small></div>`).join('')}</div>`:empty('暂无收票记录','绑定后收到新邮件时，处理结果会显示在这里。','','✉'),'<button class="btn primary" data-action="close-modal">完成</button>');
     });return;
   }
   if(action==='new-mailbox'){mailboxModal();return;}
@@ -739,6 +740,26 @@ document.addEventListener('click',async event=>{
 });
 
 
+
+async function previewEmail(button) {
+  cleanupOriginalViewers(preview);
+  const url=button.dataset.url;
+  preview.innerHTML=`<div class="modal-head"><div><h2 id="preview-title">原始邮件</h2><p data-email-subject></p></div><button type="button" class="icon-btn" data-action="close-preview" aria-label="关闭预览">×</button></div><section class="email-original" data-email-preview><div class="loading-state"><span class="spinner"></span><p>正在加载原始邮件…</p></div></section><div class="modal-footer"><button type="button" class="btn" data-action="close-preview">返回</button><button type="button" class="btn primary" data-action="download" data-url="${esc(url)}?download=true" data-filename="原始邮件.eml">下载原邮件</button></div>`;
+  const viewer=$('[data-email-preview]',preview),controller=new AbortController();
+  originalViewers.set(viewer,{controller,objectURL:null});
+  if(!preview.open)preview.showModal();
+  try {
+    const email=await api(url,{signal:controller.signal});
+    if(controller.signal.aborted)return;
+    $('[data-email-subject]',preview).textContent=email.subject || '无主题';
+    const headers=[['发件人',email.sender],['收件人',email.recipient],['发件时间',email.date]];
+    const images=(email.images || []).filter(image=>/^data:image\/(png|jpeg|gif|webp);base64,/.test(image.src));
+    const remote=(email.remote_images || []).filter(image=>/^https?:\/\//i.test(image.url));
+    viewer.innerHTML=`<dl class="email-headers">${headers.map(([name,value])=>`<div><dt>${name}</dt><dd>${esc(value || '未提供')}</dd></div>`).join('')}</dl><pre class="email-body">${esc(email.body || '这封邮件没有可显示的文字正文。')}</pre>${email.body_truncated?'<p class="hint">正文较长，下载原邮件可查看完整内容。</p>':''}${images.length?`<div class="email-images">${images.map(image=>`<figure><img src="${esc(image.src)}" alt="${esc(image.name)}"><figcaption>${esc(image.name)}</figcaption></figure>`).join('')}</div>`:''}${email.images_truncated?'<p class="hint">仅显示前 30 张内嵌图片，其余请下载原邮件查看。</p>':''}${remote.length?`<section class="email-remote"><h3>外部图片</h3><p class="minor">不会自动加载，点击链接可查看。</p><ul>${remote.map((image,index)=>`<li><a href="${esc(image.url)}" target="_blank" rel="noopener noreferrer">${esc(image.name)} ${index+1} ↗</a></li>`).join('')}</ul></section>`:''}${email.attachments?.length?`<section class="email-attachments"><h3>邮件附件</h3><ul>${email.attachments.map(item=>`<li>${esc(item.name)} <span class="minor">${esc(item.type)}</span></li>`).join('')}</ul></section>`:''}`;
+  } catch(error) {
+    if(!controller.signal.aborted)viewer.textContent=error.message;
+  }
+}
 
 function resetReceiptAddresses() {
   receiptGeneration+=1;
@@ -792,8 +813,8 @@ async function showReceiptDeliveries(addressId) {
   const deliveries=response.deliveries || [];
   const deliveryNames={queued:'等待处理',processing:'识别中',completed:'处理完成',failed:'处理失败'};
   const resultNames={imported:'已导入',duplicate:'重复跳过',ignored:'已忽略',failed:'失败'};
-  const content=deliveries.length?`<div class="receipt-deliveries">${deliveries.map(delivery=>`<article class="receipt-delivery"><div class="receipt-delivery-head"><div><strong>${esc(formatTimestamp(delivery.received_at))}</strong><span class="badge ${delivery.status==='failed'?'rejected':delivery.status==='completed'?'available':''}">${esc(deliveryNames[delivery.status] || delivery.status)}</span></div>${delivery.status==='failed' && address.can_manage?`<button class="btn small" data-action="retry-receipt-delivery" data-id="${esc(addressId)}" data-delivery="${esc(delivery.id)}">重试失败项</button>`:''}</div>${delivery.results?.length?`<div class="receipt-results">${delivery.results.map(result=>`<div class="mail-result"><div><strong>${esc(result.filename || '邮件附件')}</strong><span class="badge ${result.status==='failed'?'rejected':result.status==='imported'?'available':''}">${esc(resultNames[result.status] || result.status)}</span></div>${result.error?`<small class="${result.status==='failed'?'danger-text':''}">${esc(result.error)}</small>`:''}</div>`).join('')}</div>`:`<p class="receipt-delivery-note">${delivery.status==='queued'?'已收到邮件，等待提取发票。':delivery.status==='processing'?'正在提取和识别发票，稍后可刷新查看结果。':delivery.status==='failed'?'本次处理未完成，可以重试。':'未提取到发票附件。'}</p>`}</article>`).join('')}</div>`:empty('还没有收票记录','将发票邮件发送或转发至这个地址，处理结果会显示在这里。','','✉');
-  openModal('域名收票记录',esc(address.address),content,`<button class="btn" data-action="receipt-deliveries" data-id="${esc(addressId)}">刷新记录</button><button class="btn primary" data-action="close-modal">完成</button>`);
+  const content=deliveries.length?`<div class="receipt-deliveries">${deliveries.map(delivery=>`<article class="receipt-delivery"><div class="receipt-delivery-head"><div><strong>${esc(formatTimestamp(delivery.received_at))}</strong><span class="badge ${delivery.status==='failed'?'rejected':delivery.status==='completed'?'available':''}">${esc(deliveryNames[delivery.status] || delivery.status)}</span></div><div class="actions"><button type="button" class="btn small" data-action="preview-email" data-url="/api/receipt-addresses/${encodeURIComponent(addressId)}/deliveries/${encodeURIComponent(delivery.id)}/original" ${delivery.original_available?'':'disabled title="原始邮件已清理或不可用"'}>查看原件</button>${delivery.status==='failed' && address.can_manage?`<button class="btn small" data-action="retry-receipt-delivery" data-id="${esc(addressId)}" data-delivery="${esc(delivery.id)}">重试失败项</button>`:''}</div></div>${delivery.results?.length?`<div class="receipt-results">${delivery.results.map(result=>`<div class="mail-result"><div><strong>${esc(result.filename || '邮件附件')}</strong><span class="badge ${result.status==='failed'?'rejected':result.status==='imported'?'available':''}">${esc(resultNames[result.status] || result.status)}</span></div>${result.error?`<small class="${result.status==='failed'?'danger-text':''}">${esc(result.error)}</small>`:''}</div>`).join('')}</div>`:`<p class="receipt-delivery-note">${delivery.status==='queued'?'已收到邮件，等待提取发票。':delivery.status==='processing'?'正在提取和识别发票，稍后可刷新查看结果。':delivery.status==='failed'?'本次处理未完成，可以重试。':'未提取到发票附件。'}</p>`}</article>`).join('')}</div>`:empty('还没有收票记录','将发票邮件发送或转发至这个地址，处理结果会显示在这里。','','✉');
+  openModal('域名收票记录',esc(address.address),'<p class="hint email-retention">完成邮件原文保留至接收后 7 天；旧版已清理的邮件无法查看。</p>'+content,`<button class="btn" data-action="receipt-deliveries" data-id="${esc(addressId)}">刷新记录</button><button class="btn primary" data-action="close-modal">完成</button>`);
 }
 document.addEventListener('click',async event=>{
   const button=event.target.closest('[data-action]');

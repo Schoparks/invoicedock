@@ -5,7 +5,7 @@ participate in routing. Run a single application process for this local queue.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import os
@@ -24,6 +24,7 @@ from .auth import require_user
 from .db import LOCK, connection
 from .mailbox import MAX_MAIL_BYTES, _import_error, iter_message_attachments
 from .permissions import require_group
+from .mail_original import original_response
 
 router = APIRouter(tags=['domain receipts'])
 RESERVED_PREFIXES = {'postmaster', 'abuse', 'admin', 'administrator', 'root',
@@ -33,6 +34,7 @@ _processing = Lock()
 _stop = Event()
 _wake = Event()
 _worker: Thread | None = None
+ORIGINAL_RETENTION = timedelta(days=7)
 
 
 def _now() -> str:
@@ -72,6 +74,25 @@ def configure_importer(callback: Callable | None) -> None:
 
 def _raw_path(delivery_id: str) -> Path:
     return db_store.DATA / 'inbound' / f'{delivery_id}.eml'
+
+
+def _original_available(row) -> bool:
+    if not row['raw_path'] or not _raw_path(row['id']).is_file():
+        return False
+    return row['status'] != 'completed' or datetime.fromisoformat(row['received_at']) + ORIGINAL_RETENTION > datetime.now(timezone.utc)
+
+
+def _purge_completed_originals() -> None:
+    cutoff = (datetime.now(timezone.utc) - ORIGINAL_RETENTION).isoformat(timespec='seconds')
+    with LOCK, connection(write=True) as db:
+        rows = db.execute("""SELECT id FROM inbound_deliveries WHERE status='completed'
+                          AND raw_path<>'' AND received_at<=? LIMIT 50""", (cutoff,)).fetchall()
+        for row in rows:
+            try:
+                _raw_path(row['id']).unlink(missing_ok=True)
+            except OSError:
+                continue  # A cleanup failure must not block new receipt processing.
+            db.execute("UPDATE inbound_deliveries SET raw_path='' WHERE id=?", (row['id'],))
 
 
 def initialize_inbound() -> None:
@@ -209,12 +230,27 @@ def list_deliveries(address_id: str, user=Depends(require_user)):
     with connection() as db:
         _managed(db, address_id, user['id'])
         deliveries = []
-        for row in db.execute('''SELECT id,received_at,status FROM inbound_deliveries
+        for row in db.execute('''SELECT id,received_at,status,raw_path FROM inbound_deliveries
                              WHERE address_id=? ORDER BY received_at DESC,rowid DESC LIMIT 50''', (address_id,)):
             results = [dict(result) for result in db.execute('''SELECT filename,status,error,invoice_id
                        FROM inbound_results WHERE delivery_id=? ORDER BY rowid''', (row['id'],))]
-            deliveries.append({**dict(row), 'results': results})
+            deliveries.append({'id': row['id'], 'received_at': row['received_at'], 'status': row['status'],
+                               'original_available': _original_available(row), 'results': results})
         return {'deliveries': deliveries}
+
+
+@router.get('/api/receipt-addresses/{address_id}/deliveries/{delivery_id}/original')
+def delivery_original(address_id: str, delivery_id: str, download: bool = False, user=Depends(require_user)):
+    with LOCK, connection() as db:
+        _managed(db, address_id, user['id'])
+        row = db.execute('SELECT * FROM inbound_deliveries WHERE id=? AND address_id=?',
+                         (delivery_id, address_id)).fetchone()
+        if row is None:
+            raise HTTPException(404, '收票记录不存在')
+        if not _original_available(row):
+            raise HTTPException(410, '原始邮件已清理或不可用；旧版处理完成的邮件无法补回')
+        content = _raw_path(row['id']).read_bytes()
+    return original_response(content, download)
 
 
 @router.post('/api/receipt-addresses/{address_id}/retry')
@@ -352,13 +388,6 @@ def _process_delivery(delivery: dict) -> None:
         failed = db.execute("SELECT 1 FROM inbound_results WHERE delivery_id=? AND status='failed' LIMIT 1", (delivery_id,)).fetchone()
         status = 'failed' if failed else 'completed'
         db.execute('UPDATE inbound_deliveries SET status=? WHERE id=?', (status, delivery_id))
-    if status == 'completed':
-        try:
-            _raw_path(delivery_id).unlink(missing_ok=True)
-        except OSError:
-            return
-        with LOCK, connection(write=True) as db:
-            db.execute("UPDATE inbound_deliveries SET raw_path='' WHERE id=?", (delivery_id,))
 
 
 def process_pending(limit: int = 10) -> int:
@@ -367,6 +396,7 @@ def process_pending(limit: int = 10) -> int:
         return 0
     processed = 0
     try:
+        _purge_completed_originals()
         for _ in range(limit):
             with LOCK, connection(write=True) as db:
                 row = db.execute("SELECT * FROM inbound_deliveries WHERE status='queued' ORDER BY received_at,rowid LIMIT 1").fetchone()

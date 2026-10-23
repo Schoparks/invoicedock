@@ -30,6 +30,7 @@ from . import db as db_store
 from .db import LOCK, connection
 from .parsing import EXTENSIONS, expand_upload
 from .permissions import require_group
+from .mail_original import original_response
 
 router = APIRouter(prefix='/api/mailboxes', tags=['mailboxes'])
 MAX_MAIL_BYTES = 20 * 1024 * 1024
@@ -385,9 +386,34 @@ def delete_mailbox(mailbox_id: str, user=Depends(require_user)):
 def mailbox_results(mailbox_id: str, user=Depends(require_user)):
     with connection() as db:
         _get_managed(db, mailbox_id, user['id'])
-        results = [dict(row) for row in db.execute('''SELECT uid,filename,status,error,created_at FROM mail_results
+        results = [dict(row) for row in db.execute('''SELECT uid_validity,uid,filename,status,error,created_at FROM mail_results
                     WHERE mailbox_id=? ORDER BY created_at DESC,uid DESC LIMIT 50''', (mailbox_id,))]
         return {'results': results}
+
+
+@router.get('/{mailbox_id}/messages/{uid_validity}/{uid}/original')
+def mailbox_original(mailbox_id: str, uid_validity: str, uid: int, download: bool = False,
+                     user=Depends(require_user)):
+    with _exclusive(mailbox_id):
+        with connection() as db:
+            mailbox = _get_managed(db, mailbox_id, user['id'])
+            known = db.execute('SELECT 1 FROM mail_results WHERE mailbox_id=? AND uid_validity=? AND uid=?',
+                               (mailbox_id, uid_validity, uid)).fetchone()
+            if uid < 1 or known is None:
+                raise HTTPException(404, '收票记录不存在')
+            if uid_validity != mailbox['uid_validity']:
+                raise HTTPException(410, '邮箱 UID 已重置，旧邮件无法按原记录读取')
+        try:
+            with _session(mailbox) as client:
+                validity, _ = _uid_state(client, mailbox['folder'])
+                if validity != uid_validity:
+                    raise HTTPException(410, '邮箱 UID 已重置，旧邮件无法按原记录读取')
+                content = _fetch_message(client, uid)
+        except MessageRejected as exc:
+            raise HTTPException(410, str(exc)) from None
+        except MailboxError as exc:
+            raise HTTPException(400, str(exc)) from None
+    return original_response(content, download)
 
 
 def _record(mailbox: dict, uid: int, index: str, filename: str, status: str, error: str = '') -> None:
