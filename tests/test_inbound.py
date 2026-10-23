@@ -1,5 +1,6 @@
 """Signed domain receipts exercise the real app, parser and tenant boundaries."""
 from email.message import EmailMessage
+from datetime import datetime, timedelta, timezone
 import base64
 import hashlib
 import hmac
@@ -132,26 +133,81 @@ class InboundTests(unittest.TestCase):
         self.assertEqual(self.client.get(url.replace(event['id'],'missing')).status_code,404)
         with db.connection(write=True) as connection:
             connection.execute("UPDATE inbound_deliveries SET received_at='2020-01-01T00:00:00+00:00' WHERE id=?",(event['id'],))
-        self.assertFalse(self.ok(self.client.get(base))['deliveries'][0]['original_available'])
+        self.assertEqual(self.ok(self.client.get(base))['deliveries'],[])
         self.assertEqual(self.client.get(url).status_code,410)
         inbound.process_pending()
         self.assertFalse((self.data/'inbound'/f"{event['id']}.eml").exists())
-        self.assertEqual(self.ok(self.client.get(base))['deliveries'][0]['status'],'completed')
+        self.assertEqual(self.ok(self.client.get(base))['deliveries'],[])
+        self.assertEqual(self.client.get(url).status_code,404)
 
-    def test_failed_original_retained_and_old_cleaned_record_is_explicitly_unavailable(self):
+    def test_failed_original_retained_within_30_days_and_old_cleaned_record_is_unavailable(self):
         address = self.address()
         raw = self.mail(('retry.xml', self.xml('ORIGINAL-FAILED')))
         inbound.configure_importer(lambda *args: (_ for _ in ()).throw(ValueError('测试失败')))
         event = self.send(raw,address['address'])
         inbound.process_pending()
         with db.connection(write=True) as connection:
-            connection.execute("UPDATE inbound_deliveries SET received_at='2020-01-01T00:00:00+00:00' WHERE id=?",(event['id'],))
+            connection.execute('UPDATE inbound_deliveries SET received_at=? WHERE id=?',
+                               ((datetime.now(timezone.utc)-timedelta(days=29)).isoformat(timespec='seconds'),event['id']))
         inbound.process_pending()
         url = f"/api/receipt-addresses/{address['id']}/deliveries/{event['id']}/original"
         self.assertEqual(self.client.get(url+'?download=true').content,raw)
         with db.connection(write=True) as connection:
             connection.execute("UPDATE inbound_deliveries SET status='completed',raw_path='' WHERE id=?",(event['id'],))
         self.assertEqual(self.client.get(url).status_code,410)
+
+    def test_30_day_cleanup_removes_all_expired_mail_states_and_results_but_keeps_invoices(self):
+        address = self.address()
+        events = []
+        for index in range(6):
+            raw = self.mail() if index == 4 else self.mail((f'fixture-{index}.xml',self.xml(f'RETENTION-{index}')))
+            events.append(self.send(raw,address['address']))
+        inbound.process_pending()
+        invoices = self.ok(self.client.get('/api/state'))['invoices']
+        self.assertEqual(len(invoices),5)
+        cutoff_time = datetime.now(timezone.utc).replace(microsecond=0)-timedelta(days=30)
+        cutoff = cutoff_time.isoformat(timespec='seconds')
+        inside_window = (cutoff_time+timedelta(seconds=1)).isoformat(timespec='seconds')
+        with db.connection(write=True) as connection:
+            for event,status in zip(events[:5],('completed','failed','queued','processing','completed')):
+                connection.execute('UPDATE inbound_deliveries SET status=?,received_at=? WHERE id=?',
+                                   (status,cutoff,event['id']))
+            connection.execute("UPDATE inbound_deliveries SET raw_path='' WHERE id=?",(events[4]['id'],))
+            connection.execute('UPDATE inbound_deliveries SET received_at=? WHERE id=?',(inside_window,events[5]['id']))
+        inbound._raw_path(events[4]['id']).unlink()
+        base = '/api/receipt-addresses/'+address['id']
+        with patch.object(inbound,'_retention_cutoff',return_value=cutoff):
+            rows = self.ok(self.client.get(base+'/deliveries'))['deliveries']
+            self.assertEqual([row['id'] for row in rows],[events[5]['id']])
+            self.assertTrue(rows[0]['original_available'])
+            self.assertEqual(self.client.get(base+'/deliveries/'+events[0]['id']+'/original').status_code,410)
+            self.assertEqual(self.client.post(base+'/retry',json={'delivery_id':events[1]['id']}).status_code,410)
+            self.assertEqual(inbound.process_pending(),0)
+            with db.connection() as connection:
+                self.assertEqual([row['id'] for row in connection.execute('SELECT id FROM inbound_deliveries')],[events[5]['id']])
+                self.assertEqual({row['delivery_id'] for row in connection.execute('SELECT delivery_id FROM inbound_results')},{events[5]['id']})
+                self.assertEqual(connection.execute('PRAGMA foreign_key_check').fetchall(),[])
+            for event in events[:5]:
+                self.assertFalse(inbound._raw_path(event['id']).exists())
+            self.assertTrue(inbound._raw_path(events[5]['id']).exists())
+            self.assertEqual(self.client.get(base+'/deliveries/'+events[5]['id']+'/original').status_code,200)
+        self.assertEqual({item['id'] for item in self.ok(self.client.get('/api/state'))['invoices']},{item['id'] for item in invoices})
+        for item in invoices:
+            self.assertEqual(self.client.get(item['file_url']).status_code,200)
+
+    def test_expired_backlog_is_not_imported_while_cleanup_runs_in_batches(self):
+        address = self.address()
+        with db.connection(write=True) as connection:
+            connection.executemany('INSERT INTO inbound_deliveries(id,address_id,raw_hash,raw_path,received_at,status) VALUES (?,?,?,?,?,?)',
+                [(f'{index:032x}',address['id'],f'{index:064x}','','2020-01-01T00:00:00+00:00','queued') for index in range(51)])
+        recent = self.send(self.mail(('recent.xml',self.xml('RECENT-AFTER-BACKLOG'))),address['address'])
+        self.assertEqual(inbound.process_pending(limit=1),1)
+        self.assertEqual([item['number'] for item in self.ok(self.client.get('/api/state'))['invoices']],['RECENT-AFTER-BACKLOG'])
+        with db.connection() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM inbound_deliveries WHERE status='queued'").fetchone()[0],1)
+        self.assertEqual(inbound.process_pending(),0)
+        with db.connection() as connection:
+            self.assertEqual([row['id'] for row in connection.execute('SELECT id FROM inbound_deliveries')],[recent['id']])
 
     def test_same_invoice_formats_keep_only_pdf_regardless_of_attachment_order(self):
         import pymupdf

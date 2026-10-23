@@ -34,7 +34,7 @@ _processing = Lock()
 _stop = Event()
 _wake = Event()
 _worker: Thread | None = None
-ORIGINAL_RETENTION = timedelta(days=7)
+MAIL_RETENTION = timedelta(days=30)
 
 
 def _now() -> str:
@@ -76,23 +76,26 @@ def _raw_path(delivery_id: str) -> Path:
     return db_store.DATA / 'inbound' / f'{delivery_id}.eml'
 
 
+def _retention_cutoff() -> str:
+    return (datetime.now(timezone.utc) - MAIL_RETENTION).isoformat(timespec='seconds')
+
+
 def _original_available(row) -> bool:
-    if not row['raw_path'] or not _raw_path(row['id']).is_file():
-        return False
-    return row['status'] != 'completed' or datetime.fromisoformat(row['received_at']) + ORIGINAL_RETENTION > datetime.now(timezone.utc)
+    return bool(row['raw_path'] and row['received_at'] > _retention_cutoff()
+                and _raw_path(row['id']).is_file())
 
 
-def _purge_completed_originals() -> None:
-    cutoff = (datetime.now(timezone.utc) - ORIGINAL_RETENTION).isoformat(timespec='seconds')
+def _purge_expired_deliveries() -> None:
     with LOCK, connection(write=True) as db:
-        rows = db.execute("""SELECT id FROM inbound_deliveries WHERE status='completed'
-                          AND raw_path<>'' AND received_at<=? LIMIT 50""", (cutoff,)).fetchall()
+        rows = db.execute("""SELECT id FROM inbound_deliveries WHERE received_at<=?
+                          ORDER BY received_at,rowid LIMIT 50""", (_retention_cutoff(),)).fetchall()
         for row in rows:
             try:
                 _raw_path(row['id']).unlink(missing_ok=True)
             except OSError:
-                continue  # A cleanup failure must not block new receipt processing.
-            db.execute("UPDATE inbound_deliveries SET raw_path='' WHERE id=?", (row['id'],))
+                continue  # Keep the record for cleanup retry without blocking new receipts.
+            # Attachment results cascade; imported invoices and their originals are independent.
+            db.execute('DELETE FROM inbound_deliveries WHERE id=?', (row['id'],))
 
 
 def initialize_inbound() -> None:
@@ -124,6 +127,7 @@ def initialize_inbound() -> None:
             db.execute('ALTER TABLE inbound_deliveries ADD COLUMN group_id TEXT')
             db.execute('UPDATE inbound_deliveries SET group_id=(SELECT group_id FROM receipt_addresses a WHERE a.id=address_id)')
         db.execute('CREATE INDEX IF NOT EXISTS inbound_pending ON inbound_deliveries(status,received_at)')
+        db.execute('CREATE INDEX IF NOT EXISTS inbound_received ON inbound_deliveries(received_at)')
         db.execute('CREATE INDEX IF NOT EXISTS receipt_address_owner ON receipt_addresses(owner_id,group_id)')
         # A crash can leave a claimed delivery unfinished; per-attachment results make replay safe.
         db.execute("UPDATE inbound_deliveries SET status='queued' WHERE status='processing'")
@@ -231,7 +235,8 @@ def list_deliveries(address_id: str, user=Depends(require_user)):
         _managed(db, address_id, user['id'])
         deliveries = []
         for row in db.execute('''SELECT id,received_at,status,raw_path FROM inbound_deliveries
-                             WHERE address_id=? ORDER BY received_at DESC,rowid DESC LIMIT 50''', (address_id,)):
+                             WHERE address_id=? AND received_at>? ORDER BY received_at DESC,rowid DESC LIMIT 50''',
+                              (address_id, _retention_cutoff())):
             results = [dict(result) for result in db.execute('''SELECT filename,status,error,invoice_id
                        FROM inbound_results WHERE delivery_id=? ORDER BY rowid''', (row['id'],))]
             deliveries.append({'id': row['id'], 'received_at': row['received_at'], 'status': row['status'],
@@ -247,6 +252,8 @@ def delivery_original(address_id: str, delivery_id: str, download: bool = False,
                          (delivery_id, address_id)).fetchone()
         if row is None:
             raise HTTPException(404, '收票记录不存在')
+        if row['received_at'] <= _retention_cutoff():
+            raise HTTPException(410, '邮件及收票记录仅保留 30 天，该邮件已到期')
         if not _original_available(row):
             raise HTTPException(410, '原始邮件已清理或不可用；旧版处理完成的邮件无法补回')
         content = _raw_path(row['id']).read_bytes()
@@ -266,6 +273,8 @@ def retry_delivery(address_id: str, values: dict, user=Depends(require_user)):
                          (delivery_id, address_id)).fetchone()
         if row is None:
             raise HTTPException(404, '收票记录不存在')
+        if row['received_at'] <= _retention_cutoff():
+            raise HTTPException(410, '邮件及收票记录仅保留 30 天，该邮件已到期')
         if row['status'] != 'failed':
             raise HTTPException(409, '只有失败的收票记录可以重试')
         if not row['raw_path'] or not _raw_path(delivery_id).is_file():
@@ -396,10 +405,11 @@ def process_pending(limit: int = 10) -> int:
         return 0
     processed = 0
     try:
-        _purge_completed_originals()
+        _purge_expired_deliveries()
         for _ in range(limit):
             with LOCK, connection(write=True) as db:
-                row = db.execute("SELECT * FROM inbound_deliveries WHERE status='queued' ORDER BY received_at,rowid LIMIT 1").fetchone()
+                row = db.execute("""SELECT * FROM inbound_deliveries WHERE status='queued' AND received_at>?
+                                 ORDER BY received_at,rowid LIMIT 1""", (_retention_cutoff(),)).fetchone()
                 if row is None:
                     break
                 delivery = dict(row)
