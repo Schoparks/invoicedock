@@ -155,6 +155,8 @@ sudo systemctl reload nginx
 
 如已有同名站点配置或软链接，更新现有项即可。模板将 HTTP 重定向到 HTTPS，允许 110 MB 请求，并为批量 OCR 设置较长代理等待时间。
 
+前端 HTML、JavaScript 和 CSS 由应用返回 `Cache-Control: no-cache`，复用缓存前须重新校验；API 继续使用 `no-store`。反向代理不要覆盖此前端缓存策略。静态资源 URL 带版本标记；需要绕过既有旧缓存时同步更新 HTML 中的脚本和样式版本。
+
 保留模板的 `Host`、`X-Forwarded-For`、`X-Forwarded-Proto` 转发设置。应用仅信任来自回环代理的转发头，限速需要真实客户端地址。对外提供 80/443 即可，应用的 8765 端口保持回环监听。
 
 打开你的 HTTPS 域名，用维护命令创建的账号登录。首次确认登录、上传一张样本并人工核对、导出，再按需创建组。

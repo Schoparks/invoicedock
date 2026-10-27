@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import unittest
@@ -305,6 +306,21 @@ class InvoiceApiTests(unittest.TestCase):
             self.assertEqual(payload['batches'][0]['invoice_ids'], [invoice['id']])
             self.assertEqual(archive.read('原件/' + invoice['id'] + '_原始发票.xml'), original)
             self.assertFalse(any(name.endswith('.sqlite3') or 'secret.key' in name for name in archive.namelist()))
+
+    def test_frontend_assets_revalidate_after_updates(self):
+        response = self.client.get('/')
+        self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+        self.assertEqual(self.client.get('/index.html').headers.get('Cache-Control'), 'no-cache')
+        assets = re.findall(r'(?:href|src)="(/(?:style\.css|app\.js)\?v=[^"]+)"', response.text)
+        self.assertEqual(len(assets), 2)
+        for asset in assets:
+            with self.subTest(asset=asset):
+                response = self.client.get(asset)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.headers.get('Cache-Control'), 'no-cache')
+                cached = self.client.get(asset, headers={'If-None-Match': response.headers['etag']})
+                self.assertEqual(cached.status_code, 304)
+                self.assertEqual(cached.headers.get('Cache-Control'), 'no-cache')
 
     def test_mutations_require_local_application_headers(self):
         self.assertEqual(self.client.post('/api/projects', json={'name': '拦截'}, headers={'X-Requested-With': ''}).status_code, 403)

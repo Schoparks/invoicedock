@@ -198,6 +198,8 @@ async def local_only(request: Request, call_next):
     response.headers['Content-Security-Policy'] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
     if request.url.path.startswith('/api/'):
         response.headers['Cache-Control'] = 'no-store'
+    elif request.url.path in {'/', '/index.html', '/app.js', '/style.css'}:
+        response.headers['Cache-Control'] = 'no-cache'
     return response
 
 
